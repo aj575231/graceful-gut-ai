@@ -58,3 +58,6 @@ override.tf.json
 
 # AWS
 .aws-sam/
+
+# Lambda deployment packages
+.build/
