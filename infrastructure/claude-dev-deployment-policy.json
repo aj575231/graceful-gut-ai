@@ -1,0 +1,64 @@
+{
+    "Version":  "2012-10-17",
+    "Statement":  [
+                      {
+                          "Effect":  "Allow",
+                          "Sid":  "ReadIdentity",
+                          "Resource":  "*",
+                          "Action":  [
+                                         "sts:GetCallerIdentity"
+                                     ]
+                      },
+                      {
+                          "Effect":  "Allow",
+                          "Sid":  "ManageGracefulGutLambda",
+                          "Resource":  "arn:aws:lambda:us-east-2:832987002206:function:graceful-gut-ai-dev-api",
+                          "Action":  [
+                                         "lambda:GetFunction",
+                                         "lambda:GetFunctionConfiguration",
+                                         "lambda:GetFunctionUrlConfig",
+                                         "lambda:GetPolicy",
+                                         "lambda:ListTags",
+                                         "lambda:UpdateFunctionCode",
+                                         "lambda:UpdateFunctionConfiguration",
+                                         "lambda:PutFunctionConcurrency",
+                                         "lambda:DeleteFunctionConcurrency",
+                                         "lambda:AddPermission",
+                                         "lambda:RemovePermission",
+                                         "lambda:CreateFunctionUrlConfig",
+                                         "lambda:UpdateFunctionUrlConfig",
+                                         "lambda:InvokeFunction"
+                                     ]
+                      },
+                      {
+                          "Effect":  "Allow",
+                          "Sid":  "ReadAndManageGracefulGutLogs",
+                          "Resource":  "arn:aws:logs:us-east-2:832987002206:log-group:/aws/lambda/graceful-gut-ai-dev-api:*",
+                          "Action":  [
+                                         "logs:DescribeLogStreams",
+                                         "logs:FilterLogEvents",
+                                         "logs:GetLogEvents",
+                                         "logs:PutRetentionPolicy",
+                                         "logs:TagLogGroup",
+                                         "logs:TagResource"
+                                     ]
+                      },
+                      {
+                          "Effect":  "Allow",
+                          "Sid":  "ListLogGroups",
+                          "Resource":  "*",
+                          "Action":  [
+                                         "logs:DescribeLogGroups"
+                                     ]
+                      },
+                      {
+                          "Effect":  "Allow",
+                          "Sid":  "ReadAndPassLambdaExecutionRole",
+                          "Resource":  "arn:aws:iam::832987002206:role/GracefulGutAI-LambdaExecutionRole",
+                          "Action":  [
+                                         "iam:GetRole",
+                                         "iam:PassRole"
+                                     ]
+                      }
+                  ]
+}
