@@ -1,4 +1,4 @@
-﻿# Environment variables and secrets
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
@@ -58,6 +58,10 @@ override.tf.json
 
 # AWS
 .aws-sam/
+.aws/
+credentials
 
 # Lambda deployment packages
 .build/
+*.zip
+*.tar.gz

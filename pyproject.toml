@@ -1,0 +1,26 @@
+[tool.ruff]
+# Match the deployed Lambda runtime, not the local interpreter.
+target-version = "py313"
+line-length = 88
+src = ["backend"]
+extend-exclude = [".build", ".venv"]
+
+[tool.ruff.lint]
+# Pinned rule set so lint results are reproducible across machines and CI.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.format]
+docstring-code-format = true

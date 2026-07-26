@@ -1,0 +1,77 @@
+{
+  "_comment": [
+    "Intended resource-based policy for the graceful-gut-ai-dev-api Function URL.",
+    "This file is the reference copy; the live policy is managed with",
+    "'aws lambda add-permission' / 'aws lambda remove-permission' and can be read",
+    "back with 'aws lambda get-policy --function-name graceful-gut-ai-dev-api'.",
+    "",
+    "<AWS_ACCOUNT_ID> is a placeholder. Substitute the real account ID at apply",
+    "time; it is deliberately not stored in this repository.",
+    "",
+    "TWO statements are required, and both must be present for the Function URL",
+    "to serve traffic:",
+    "",
+    "  1. GracefulGutPublicInvokeUrl - lambda:InvokeFunctionUrl, conditioned on",
+    "     the function URL auth type being NONE. This authorizes the URL itself.",
+    "  2. GracefulGutPublicInvokeFunction - lambda:InvokeFunction, conditioned on",
+    "     lambda:InvokedViaFunctionUrl. This authorizes the underlying invoke and",
+    "     narrows it to requests that actually arrive through the Function URL.",
+    "",
+    "A previous audit claimed statement 2 was redundant and it was removed. That",
+    "was wrong: without it the URL returns a steady 403 on every route. It",
+    "appears healthy for ~10-20s after removal only because of policy caching.",
+    "Do not remove it again.",
+    "",
+    "Both statements are applied with the AWS CLI. The InvokedViaFunctionUrl",
+    "condition is supported directly by the --invoked-via-function-url flag, so",
+    "CloudFormation, Terraform, and the console are NOT required for it:",
+    "",
+    "  aws lambda add-permission \\",
+    "    --function-name graceful-gut-ai-dev-api --region us-east-2 \\",
+    "    --statement-id GracefulGutPublicInvokeUrl \\",
+    "    --action lambda:InvokeFunctionUrl --principal '*' \\",
+    "    --function-url-auth-type NONE",
+    "",
+    "  aws lambda add-permission \\",
+    "    --function-name graceful-gut-ai-dev-api --region us-east-2 \\",
+    "    --statement-id GracefulGutPublicInvokeFunction \\",
+    "    --action lambda:InvokeFunction --principal '*' \\",
+    "    --invoked-via-function-url",
+    "",
+    "AuthType is NONE, so this policy intentionally allows anonymous callers to",
+    "reach the URL. Access control is enforced in application code by the X-GG-Key",
+    "shared-secret header, which is temporary internal-development protection",
+    "only and must never be shipped to a browser client. Before any public,",
+    "browser-facing client and before Phase 2 accepts free-text input, this",
+    "endpoint must move behind API Gateway with server-side abuse controls. See",
+    "the Phase 2 public-endpoint gate in CLAUDE.md."
+  ],
+  "Version": "2012-10-17",
+  "Id": "default",
+  "Statement": [
+    {
+      "Sid": "GracefulGutPublicInvokeUrl",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "lambda:InvokeFunctionUrl",
+      "Resource": "arn:aws:lambda:us-east-2:<AWS_ACCOUNT_ID>:function:graceful-gut-ai-dev-api",
+      "Condition": {
+        "StringEquals": {
+          "lambda:FunctionUrlAuthType": "NONE"
+        }
+      }
+    },
+    {
+      "Sid": "GracefulGutPublicInvokeFunction",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:us-east-2:<AWS_ACCOUNT_ID>:function:graceful-gut-ai-dev-api",
+      "Condition": {
+        "Bool": {
+          "lambda:InvokedViaFunctionUrl": "true"
+        }
+      }
+    }
+  ]
+}
