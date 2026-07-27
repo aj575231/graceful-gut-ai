@@ -247,6 +247,21 @@ a more privileged execution role to the function. `GracefulGutAI-LambdaExecution
 own attached policies are not readable from the dev role and remain unaudited —
 review them separately with admin credentials.
 
+#### The tracked policy file is pure IAM policy language
+
+`claude-dev-deployment-policy.json` contains **only** `Version` and `Statement`.
+IAM rejects unknown top-level properties, so a `_comment` block — which that file
+used to carry — makes the document unapplyable as written. Explanatory text
+belongs in `infrastructure/README.md`, which is also where the placeholder
+convention is recorded: `<AWS_ACCOUNT_ID>` is substituted at apply time, and the
+region is written literally as `us-east-2` because the deployment is pinned to
+one region.
+
+`backend/tests/test_infrastructure_policy.py` enforces this. It fails if the
+top-level keys are anything but `Version` and `Statement`, if any of the four
+administrator-only actions reappears (including via a `lambda:*` wildcard), or if
+rendering the placeholders leaves anything unresolved.
+
 ---
 
 ## Secrets

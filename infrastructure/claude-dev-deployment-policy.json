@@ -1,27 +1,4 @@
 {
-  "_comment": [
-    "Reference copy of the deployment policy attached to GracefulGutAI-ClaudeDevRole.",
-    "<AWS_ACCOUNT_ID> is a placeholder. Substitute the real account ID at apply",
-    "time; it is deliberately not stored in this repository.",
-    "",
-    "This copy is documentation only -- the dev role cannot modify IAM. Applying",
-    "it requires admin credentials.",
-    "",
-    "FUNCTION URL ADMINISTRATION IS ADMINISTRATOR-ONLY. This role deliberately",
-    "holds NO lambda:AddPermission, lambda:RemovePermission,",
-    "lambda:CreateFunctionUrlConfig, or lambda:UpdateFunctionUrlConfig. Creating",
-    "a Function URL, or changing its AuthType, CORS configuration, or",
-    "resource-based policy, requires administrator credentials and is performed",
-    "outside this host. Those settings decide who can reach the function at all:",
-    "the resource policy grants Principal '*', and AuthType NONE is what makes",
-    "the endpoint anonymous, so the dev role must not be able to alter either.",
-    "",
-    "Inspection is retained: lambda:GetFunctionUrlConfig reads the URL, AuthType,",
-    "and CORS settings, and lambda:GetPolicy reads the resource policy back. A",
-    "session can verify the configuration in full; it just cannot change it. See",
-    "infrastructure/lambda-url-resource-policy.json for the statements and the",
-    "commands an administrator runs."
-  ],
   "Version": "2012-10-17",
   "Statement": [
     {
