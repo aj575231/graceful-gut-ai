@@ -245,7 +245,11 @@ a shared host.
 
 ---
 
-## Addendum — 2026-07-27: dev-role permissions restricted
+## Addendum 1 — 2026-07-27: dev-role permissions restricted
+
+> Partly superseded by **Addendum 2** below, which removes the two Function URL
+> configuration actions this addendum left in place. The scope table here
+> reflects the state after addendum 1 only.
 
 **Nothing was deployed. No AWS resource was created, modified, or deleted by
 this change.** It is a repository-only edit to the reference IAM policy and the
@@ -304,7 +308,8 @@ granted. They configure the URL endpoint itself — auth type and CORS — and a
 distinct from the resource policy, but `UpdateFunctionUrlConfig` could in
 principle change `AuthType`. They were left in place because deploy tooling may
 need them; drop them too if the Function URL configuration is considered final.
-Flagged for an owner decision, not acted on.
+Flagged for an owner decision, not acted on. **Resolved in addendum 2 — both
+were dropped.**
 
 `GracefulGutAI-LambdaExecutionRole` remains unaudited — its attached policies
 are still not readable from the dev role.
@@ -314,6 +319,93 @@ are still not readable from the dev role.
 The repository copy is documentation. The narrowed policy must be applied to
 the live role with administrator credentials before the removal takes effect;
 until then the live role still holds `lambda:AddPermission`.
+
+### Verification
+
+| Check | Result |
+| --- | --- |
+| `python -m pytest -q` | **32 passed**, 2 warnings |
+| `ruff check backend/` | **All checks passed!** |
+| `ruff format --check backend/` | **8 files already formatted** |
+| `git diff --check` | clean |
+| Both policy files parse as valid JSON | yes |
+
+---
+
+## Addendum 2 — 2026-07-27: Function URL administration restricted
+
+**Nothing was deployed. No AWS resource was created, modified, or deleted by
+this change.** Like addendum 1, it is a repository-only edit to the reference
+IAM policy and the documentation around it.
+
+### Change
+
+`lambda:CreateFunctionUrlConfig` and `lambda:UpdateFunctionUrlConfig` were
+removed from the `ManageGracefulGutLambda` statement in
+`infrastructure/claude-dev-deployment-policy.json`, closing the item addendum 1
+left open for an owner decision.
+
+**Creating or modifying a Function URL — the URL itself, its `AuthType`, its
+CORS configuration, or its resource-based policy — now requires administrator
+credentials.** With addendum 1, that makes four withheld actions:
+
+| Change | Action withheld |
+| --- | --- |
+| Create a Function URL | `lambda:CreateFunctionUrlConfig` |
+| Change `AuthType` or CORS | `lambda:UpdateFunctionUrlConfig` |
+| Add a resource-policy statement | `lambda:AddPermission` |
+| Remove a resource-policy statement | `lambda:RemovePermission` |
+
+The rationale is that these four settings, and not the function code, decide
+who may reach the service: `AuthType: NONE` is what makes the endpoint
+anonymous, CORS decides which browser origins may call it, and the resource
+policy grants `Principal: '*'`. A host that can deploy code should not also be
+able to change who is permitted to run it. `GracefulGutAI-ClaudeDevRole` now
+receives `AccessDeniedException` on all four.
+
+**Inspection is deliberately retained.** `lambda:GetFunctionUrlConfig` reads the
+URL, `AuthType`, and CORS settings; `lambda:GetPolicy` reads the resource policy
+back. A session can verify the full Function URL configuration without admin
+credentials — it simply cannot change any of it. A session that finds the URL
+returning 403, or `AuthType` or CORS wrong, should report it and stop.
+
+### Deploy tooling is unaffected
+
+Checked before removing: `scripts/deploy-lambda.sh` touches the Function URL
+only at line 77, via `aws lambda get-function-url-config`, which is a read and
+is still permitted. No script, test, or CI workflow in the repository calls
+`create-function-url-config` or `update-function-url-config`. `deploy-lambda.sh`
+needs `UpdateFunctionCode`, `GetFunction`, and the URL read, all retained, so
+`bash scripts/deploy-lambda.sh` continues to work under the narrowed policy.
+
+### Confirmed final scope of `GracefulGutAI-ClaudeDevRole`
+
+| Capability | Actions | Resource scope |
+| --- | --- | --- |
+| Identity check | `sts:GetCallerIdentity` | `*` (takes no resource) |
+| Inspect the function | `lambda:GetFunction`, `GetFunctionConfiguration`, `GetFunctionUrlConfig`, `GetPolicy`, `ListTags` | the dev function ARN only |
+| Update code and configuration | `lambda:UpdateFunctionCode`, `UpdateFunctionConfiguration`, `PutFunctionConcurrency`, `DeleteFunctionConcurrency` | the dev function ARN only |
+| Invoke the function | `lambda:InvokeFunction` | the dev function ARN only |
+| Read and configure logs | `logs:DescribeLogStreams`, `FilterLogEvents`, `GetLogEvents`, `PutRetentionPolicy`, `TagLogGroup`, `TagResource`, `ListTagsForResource` | the function's log group only |
+| List log groups | `logs:DescribeLogGroups` | `*` (not resource-scopeable in IAM) |
+| Pass the execution role | `iam:GetRole`, `iam:PassRole` | `GracefulGutAI-LambdaExecutionRole` only |
+
+The role holds no IAM write actions, no Function URL write actions, and no
+resource-policy actions. Every remaining write is scoped to the single dev
+function or its log group. `iam:PassRole` is pinned to one role, so a more
+privileged execution role cannot be attached to the function.
+
+Recorded in `CLAUDE.md` (new "Function URL administration is administrator-only"
+section) and in the `_comment` blocks of both `infrastructure/*.json` policy
+files.
+
+### Apply step, still outstanding
+
+Unchanged from addendum 1: the repository copy is documentation. Until an
+administrator applies the narrowed policy to the live role, the live role still
+holds all four withheld actions.
+
+`GracefulGutAI-LambdaExecutionRole` also remains unaudited.
 
 ### Verification
 

@@ -156,7 +156,32 @@ release gate, not a recommendation:
 Until all four are done, the endpoint stays internal and free-text input stays
 unaccepted.
 
-### Function URL resource policy — two statements, both required
+### Function URL administration is administrator-only
+
+Everything that decides **who can reach this function** is off-limits to this
+host. `GracefulGutAI-ClaudeDevRole` holds none of the four actions below and
+gets `AccessDeniedException` on any of them:
+
+| Change | Action withheld |
+| --- | --- |
+| Create a Function URL | `lambda:CreateFunctionUrlConfig` |
+| Change the URL's `AuthType` or CORS configuration | `lambda:UpdateFunctionUrlConfig` |
+| Add a resource-policy statement | `lambda:AddPermission` |
+| Remove a resource-policy statement | `lambda:RemovePermission` |
+
+All four require **administrator credentials** and are performed outside this
+host. The reason is the security model: `AuthType: NONE` is what makes the
+endpoint anonymous, CORS decides which origins a browser may call it from, and
+the resource policy grants `Principal: '*'`. A host that can deploy code should
+not also be able to change who is allowed to run it.
+
+**Inspection is fully retained.** `lambda:GetFunctionUrlConfig` reads the URL,
+`AuthType`, and CORS; `lambda:GetPolicy` reads the resource policy back. A
+session can verify every one of these settings — it just cannot change them. A
+session that finds the URL returning 403, or the `AuthType` or CORS wrong,
+should report it and stop, not attempt a repair.
+
+#### Resource policy — two statements, both required
 
 The reference copy is `infrastructure/lambda-url-resource-policy.json`. The
 live policy needs **both** of these; the URL returns a steady 403 on every
@@ -167,14 +192,9 @@ route if either is missing:
 | `GracefulGutPublicInvokeUrl` | `lambda:InvokeFunctionUrl` | function URL auth type `NONE` |
 | `GracefulGutPublicInvokeFunction` | `lambda:InvokeFunction` | `lambda:InvokedViaFunctionUrl` |
 
-**Changing this policy requires administrator credentials.** Both statements
-grant `Principal: '*'`, so applying, repairing, or removing either one is an
-administrator action performed outside this host. `GracefulGutAI-ClaudeDevRole`
-holds neither `lambda:AddPermission` nor `lambda:RemovePermission` and will get
-`AccessDeniedException` if a session tries. A session that finds the URL
-returning 403 should report it and stop, not attempt a repair.
-
-The commands an administrator runs:
+Both statements grant `Principal: '*'`, which is why applying, repairing, or
+removing either one is an administrator action, per the rule above. The commands
+an administrator runs:
 
 ```bash
 aws lambda add-permission \
@@ -210,16 +230,17 @@ policy on `GracefulGutAI-ClaudeDevRole`. It is scoped to exactly this:
 | --- | --- | --- |
 | Identity check | `sts:GetCallerIdentity` | `*` |
 | Inspect the function | `lambda:GetFunction`, `GetFunctionConfiguration`, `GetFunctionUrlConfig`, `GetPolicy`, `ListTags` | the dev function only |
-| Update code and configuration | `lambda:UpdateFunctionCode`, `UpdateFunctionConfiguration`, `PutFunctionConcurrency`, `DeleteFunctionConcurrency`, `CreateFunctionUrlConfig`, `UpdateFunctionUrlConfig` | the dev function only |
+| Update code and configuration | `lambda:UpdateFunctionCode`, `UpdateFunctionConfiguration`, `PutFunctionConcurrency`, `DeleteFunctionConcurrency` | the dev function only |
 | Invoke | `lambda:InvokeFunction` | the dev function only |
 | Read and configure logs | `logs:DescribeLogStreams`, `FilterLogEvents`, `GetLogEvents`, `PutRetentionPolicy`, `TagLogGroup`, `TagResource`, `ListTagsForResource` (plus `DescribeLogGroups` on `*`, which cannot be resource-scoped) | the function's log group only |
 | Pass the execution role | `iam:GetRole`, `iam:PassRole` | `GracefulGutAI-LambdaExecutionRole` only |
 
-`lambda:AddPermission` and `lambda:RemovePermission` were **removed** — the
-resource policy is administrator-only, as described above. Do not add them back.
-
-The role can still read the live resource policy with `lambda:GetPolicy`, which
-is what verification needs; it just cannot change it.
+`lambda:AddPermission`, `lambda:RemovePermission`,
+`lambda:CreateFunctionUrlConfig`, and `lambda:UpdateFunctionUrlConfig` were all
+**removed** — Function URL administration is administrator-only, as described
+above. Do not add them back. The read-only counterparts,
+`lambda:GetFunctionUrlConfig` and `lambda:GetPolicy`, are deliberately kept so
+verification still works without admin credentials.
 
 Note that `iam:PassRole` is scoped to a single role, so this host cannot attach
 a more privileged execution role to the function. `GracefulGutAI-LambdaExecutionRole`'s
