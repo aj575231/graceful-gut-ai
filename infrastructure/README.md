@@ -13,12 +13,18 @@ angle-bracket placeholders that are substituted at apply time:
 | Placeholder | Substitute with |
 | --- | --- |
 | `<AWS_ACCOUNT_ID>` | the real account ID — `aws sts get-caller-identity --query Account --output text` |
+| `<AWS_REGION>` | `us-east-2` |
 
-The region is **not** a placeholder. `us-east-2` is written literally into every
-ARN because the deployment is pinned to that one region (see CLAUDE.md). If a
-second region is ever added, introduce `<AWS_REGION>` alongside
-`<AWS_ACCOUNT_ID>`; `backend/tests/test_infrastructure_policy.py` already
-accepts it.
+The region is usually **not** a placeholder: `us-east-2` is written literally
+into the Lambda and CloudWatch Logs ARNs in `claude-dev-deployment-policy.json`
+because the deployment is pinned to that one region (see CLAUDE.md).
+
+`lambda-execution-secrets-policy.json` is the exception — it uses
+`<AWS_REGION>`, because a Secrets Manager ARN is the one place where a
+copy-paste into the wrong region silently grants access to a *different*
+secret than the reader expects. Making the region an explicit substitution step
+forces the operator to look at it. `backend/tests/test_infrastructure_policy.py`
+accepts both conventions and asserts that this file keeps both placeholders.
 
 A rendered document must contain **no** remaining `<...>` placeholders before it
 is applied. The test suite asserts both halves of that: every placeholder in the
@@ -60,10 +66,53 @@ credentials — it just cannot change them. A session that finds the URL returni
 403, or the `AuthType` or CORS wrong, should report it and stop, not attempt a
 repair.
 
+**No Secrets Manager access.** The role holds no `secretsmanager:` action, and
+must not be given one. This host can point the function at a secret —
+`GG_API_SECRET_ID` is an identifier, set through
+`lambda:UpdateFunctionConfiguration` — but it cannot read the value. That
+separation is the whole point of moving the shared secret out of the function's
+environment: a session that can deploy code should not also be able to read the
+live key. The test suite fails if any `secretsmanager:` action appears here,
+including under a wildcard.
+
 `iam:PassRole` is scoped to `GracefulGutAI-LambdaExecutionRole` alone, so this
 host cannot attach a more privileged execution role to the function. That
 execution role's own attached policies are not readable from the dev role and
 remain unaudited — review them separately with administrator credentials.
+
+## `lambda-execution-secrets-policy.json`
+
+The identity policy that lets **`GracefulGutAI-LambdaExecutionRole`** — the
+function's own role, not this host's — read the `X-GG-Key` shared secret at
+request time. It grants exactly one action:
+
+| Action | Resource |
+| --- | --- |
+| `secretsmanager:GetSecretValue` | `arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:graceful-gut-ai/dev/api-key-*` |
+
+No create, update, rotate, delete, list, or describe. No second secret: the
+resource is scoped to one name, and `*` in that position would grant every
+secret in the account.
+
+The trailing `-*` is **required**, not sloppiness. Secrets Manager appends a
+random six-character suffix to a secret's ARN, so a policy naming the bare
+`...:secret:graceful-gut-ai/dev/api-key` matches nothing and the function
+returns 503 on every gated route.
+
+Applying it requires administrator credentials — this host holds no IAM write
+actions:
+
+```bash
+aws iam put-role-policy \
+  --role-name GracefulGutAI-LambdaExecutionRole \
+  --policy-name GracefulGutAI-ReadApiKeySecret \
+  --policy-document file://infrastructure/lambda-execution-secrets-policy.json
+```
+
+Substitute both placeholders first. The secret itself is created separately,
+also by an administrator; the exact commands are in CLAUDE.md under
+"Administrator actions for the secret". No secret value belongs in this
+repository at any point in that process.
 
 ## `lambda-url-resource-policy.json`
 
@@ -101,6 +150,7 @@ public-endpoint gate in CLAUDE.md.
 | File | Status |
 | --- | --- |
 | `claude-dev-trust-policy.json` | trust policy for the dev role |
+| `lambda-execution-secrets-policy.json` | documented above — `GetSecretValue` on the one API-key secret |
 | `lambda-trust-policy.json` | trust policy for the Lambda execution role |
 | `claude-dev-user-data.sh` | dev host bootstrap |
 | `ecr-lifecycle-policy.json` | **reserved** for a possible future container migration — ECR is not in use; the deployed function is a ZIP package |

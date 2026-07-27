@@ -20,6 +20,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 POLICY_PATH = REPO_ROOT / "infrastructure" / "claude-dev-deployment-policy.json"
+SECRETS_POLICY_PATH = (
+    REPO_ROOT / "infrastructure" / "lambda-execution-secrets-policy.json"
+)
 
 # An identity policy has exactly these two top-level elements. ``Id`` is legal
 # in a *resource* policy but not here, and everything else -- ``_comment``
@@ -35,6 +38,20 @@ FORBIDDEN_ACTIONS = {
     "lambda:CreateFunctionUrlConfig",
     "lambda:UpdateFunctionUrlConfig",
 }
+
+# Reading the shared secret is the Lambda execution role's job, not this
+# host's. The dev role can deploy code and read logs; letting it also read the
+# secret would put a live credential one API call away from a session that has
+# no use for it. See infrastructure/README.md.
+SECRET_READING_ACTIONS = {
+    "secretsmanager:GetSecretValue",
+    "secretsmanager:BatchGetSecretValue",
+    "secretsmanager:ListSecrets",
+    "secretsmanager:DescribeSecret",
+}
+
+# The only action the execution role's secrets policy may grant.
+EXPECTED_SECRETS_ACTIONS = {"secretsmanager:GetSecretValue"}
 
 # Placeholders the apply-time rendering step knows how to substitute. Region is
 # currently written literally; ``AWS_REGION`` is accepted so parameterising it
@@ -156,3 +173,99 @@ def test_no_unresolved_placeholders_remain_after_rendering(raw_policy: str) -> N
     assert PLACEHOLDER_PATTERN.search(rendered) is None
     assert "<" not in rendered
     assert ">" not in rendered
+
+
+@pytest.mark.parametrize("forbidden", sorted(SECRET_READING_ACTIONS))
+def test_dev_role_cannot_read_the_shared_secret(
+    policy: dict[str, Any], forbidden: str
+) -> None:
+    """The deploy host configures the secret's *identifier*, never its value.
+
+    Phase 1D moved the shared secret into Secrets Manager so it stops appearing
+    in the function's environment. That gain is undone if the role this host
+    assumes can simply call GetSecretValue.
+    """
+    assert forbidden not in iter_actions(policy)
+
+
+def test_no_secretsmanager_action_reaches_the_dev_role(
+    policy: dict[str, Any],
+) -> None:
+    """Not just the named four -- the dev role holds no Secrets Manager access.
+
+    A wildcard such as ``secretsmanager:*`` or ``secretsmanager:Get*`` would
+    grant secret reading without ever naming the action.
+    """
+    for action in iter_actions(policy):
+        assert not action.lower().startswith("secretsmanager:")
+
+
+# ---------------------------------------------------------------------------
+# The Lambda execution role's secrets policy
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def raw_secrets_policy() -> str:
+    return SECRETS_POLICY_PATH.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def secrets_policy(raw_secrets_policy: str) -> dict[str, Any]:
+    return json.loads(raw_secrets_policy)
+
+
+def test_secrets_policy_is_pure_iam_policy_language(
+    secrets_policy: dict[str, Any],
+) -> None:
+    """Same constraint as the deployment policy: IAM rejects extra keys."""
+    assert set(secrets_policy) == EXPECTED_TOP_LEVEL_KEYS
+    assert secrets_policy["Version"] == "2012-10-17"
+
+
+def test_secrets_policy_grants_only_get_secret_value(
+    secrets_policy: dict[str, Any],
+) -> None:
+    """Read one secret, nothing else. No create, update, rotate, or delete."""
+    assert set(iter_actions(secrets_policy)) == EXPECTED_SECRETS_ACTIONS
+
+
+def test_secrets_policy_is_scoped_to_the_api_key_secret(
+    secrets_policy: dict[str, Any],
+) -> None:
+    """``*`` here would grant every secret in the account, not just this one."""
+    for statement in secrets_policy["Statement"]:
+        resource = statement["Resource"]
+        assert statement["Effect"] == "Allow"
+        assert resource != "*"
+        assert resource.startswith("arn:aws:secretsmanager:")
+        # Secrets Manager appends a random six-character suffix to a secret's
+        # ARN, so the trailing wildcard is required for the name to match.
+        assert resource.endswith(":secret:graceful-gut-ai/dev/api-key-*")
+
+
+def test_secrets_policy_keeps_account_and_region_as_placeholders(
+    raw_secrets_policy: str,
+) -> None:
+    """Neither the account ID nor the region is checked in."""
+    found = set(PLACEHOLDER_PATTERN.findall(raw_secrets_policy))
+
+    assert found == {"AWS_ACCOUNT_ID", "AWS_REGION"}
+    assert found <= SUPPORTED_PLACEHOLDERS
+
+
+def test_secrets_policy_renders_to_a_valid_live_policy(
+    raw_secrets_policy: str,
+) -> None:
+    rendered_text = render(raw_secrets_policy, RENDER_VALUES)
+    rendered = json.loads(rendered_text)
+
+    assert PLACEHOLDER_PATTERN.search(rendered_text) is None
+    assert "<" not in rendered_text
+    assert ">" not in rendered_text
+    assert set(rendered) == EXPECTED_TOP_LEVEL_KEYS
+
+    for statement in rendered["Statement"]:
+        resource = statement["Resource"]
+        assert RENDER_VALUES["AWS_ACCOUNT_ID"] in resource
+        assert f":{RENDER_VALUES['AWS_REGION']}:" in resource

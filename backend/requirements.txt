@@ -3,3 +3,12 @@
 fastapi==0.139.2
 pydantic==2.13.4
 uvicorn[standard]==0.51.0
+
+# Secrets Manager retrieval for the shared secret, with per-container caching.
+aws-lambda-powertools==3.31.1
+
+# boto3 is the one deliberate difference from requirements-lambda.txt: the
+# Lambda runtime already ships it, so putting it in the ZIP would be dead
+# weight. Every other host -- container, local uvicorn, the test suite -- needs
+# it for the Powertools parameters utility.
+boto3==1.43.56

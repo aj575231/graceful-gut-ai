@@ -95,9 +95,20 @@ if backslashes:
     problems.append(f"{len(backslashes)} entries contain a backslash")
 if executables:
     problems.append(f"{len(executables)} console-script/exe entries present")
-for required in ("app/main.py", "app/lambda_handler.py", "app/config.py"):
+for required in (
+    "app/main.py",
+    "app/lambda_handler.py",
+    "app/config.py",
+    "app/secrets.py",
+):
     if required not in names:
         problems.append(f"missing {required}")
+
+# Deployed postures read the shared secret through Powertools. Without it in
+# the package every gated route fails closed with a 503 at runtime, which is
+# safe but is a silent outage -- catch it at build time instead.
+if not any(n.startswith("aws_lambda_powertools/") for n in names):
+    problems.append("aws_lambda_powertools is missing from the package")
 
 if problems:
     sys.exit("    FAILED: " + "; ".join(problems))

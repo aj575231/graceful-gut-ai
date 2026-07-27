@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 
+from app.secrets import resolve_secret_api_key
+
 #: The only ``APP_ENV`` value that relaxes security. Local development only --
 #: it must never be set on a deployed function. See CLAUDE.md.
 DEVELOPMENT = "development"
@@ -41,8 +43,27 @@ def is_development() -> bool:
 
 
 def api_key() -> str:
-    """Return the configured shared secret, or an empty string if unset."""
+    """Return the shared secret from the local environment.
+
+    Local development only. ``GG_API_KEY`` is ignored by every other posture --
+    see ``resolve_api_key`` -- so setting it on a deployed function has no
+    effect and should not be done.
+    """
     return os.environ.get("GG_API_KEY", "").strip()
+
+
+def resolve_api_key() -> str:
+    """Return the shared secret for the current security posture.
+
+    ``development`` reads ``GG_API_KEY`` from the local environment and never
+    contacts AWS, so local work needs no AWS credentials. Every other posture
+    -- ``production`` and anything treated as it -- ignores ``GG_API_KEY``
+    entirely and reads the secret from Secrets Manager, raising
+    ``SecretUnavailableError`` rather than falling back to the environment.
+    """
+    if is_development():
+        return api_key()
+    return resolve_secret_api_key()
 
 
 def openapi_url() -> str | None:
