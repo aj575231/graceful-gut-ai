@@ -1,64 +1,84 @@
 {
-    "Version":  "2012-10-17",
-    "Statement":  [
-                      {
-                          "Effect":  "Allow",
-                          "Sid":  "ReadIdentity",
-                          "Resource":  "*",
-                          "Action":  [
-                                         "sts:GetCallerIdentity"
-                                     ]
-                      },
-                      {
-                          "Effect":  "Allow",
-                          "Sid":  "ManageGracefulGutLambda",
-                          "Resource":  "arn:aws:lambda:us-east-2:832987002206:function:graceful-gut-ai-dev-api",
-                          "Action":  [
-                                         "lambda:GetFunction",
-                                         "lambda:GetFunctionConfiguration",
-                                         "lambda:GetFunctionUrlConfig",
-                                         "lambda:GetPolicy",
-                                         "lambda:ListTags",
-                                         "lambda:UpdateFunctionCode",
-                                         "lambda:UpdateFunctionConfiguration",
-                                         "lambda:PutFunctionConcurrency",
-                                         "lambda:DeleteFunctionConcurrency",
-                                         "lambda:AddPermission",
-                                         "lambda:RemovePermission",
-                                         "lambda:CreateFunctionUrlConfig",
-                                         "lambda:UpdateFunctionUrlConfig",
-                                         "lambda:InvokeFunction"
-                                     ]
-                      },
-                      {
-                          "Effect":  "Allow",
-                          "Sid":  "ReadAndManageGracefulGutLogs",
-                          "Resource":  "arn:aws:logs:us-east-2:832987002206:log-group:/aws/lambda/graceful-gut-ai-dev-api:*",
-                          "Action":  [
-                                         "logs:DescribeLogStreams",
-                                         "logs:FilterLogEvents",
-                                         "logs:GetLogEvents",
-                                         "logs:PutRetentionPolicy",
-                                         "logs:TagLogGroup",
-                                         "logs:TagResource"
-                                     ]
-                      },
-                      {
-                          "Effect":  "Allow",
-                          "Sid":  "ListLogGroups",
-                          "Resource":  "*",
-                          "Action":  [
-                                         "logs:DescribeLogGroups"
-                                     ]
-                      },
-                      {
-                          "Effect":  "Allow",
-                          "Sid":  "ReadAndPassLambdaExecutionRole",
-                          "Resource":  "arn:aws:iam::832987002206:role/GracefulGutAI-LambdaExecutionRole",
-                          "Action":  [
-                                         "iam:GetRole",
-                                         "iam:PassRole"
-                                     ]
-                      }
-                  ]
+  "_comment": [
+    "Reference copy of the deployment policy attached to GracefulGutAI-ClaudeDevRole.",
+    "<AWS_ACCOUNT_ID> is a placeholder. Substitute the real account ID at apply",
+    "time; it is deliberately not stored in this repository.",
+    "",
+    "This copy is documentation only -- the dev role cannot modify IAM. Applying",
+    "it requires admin credentials.",
+    "",
+    "FUNCTION URL ADMINISTRATION IS ADMINISTRATOR-ONLY. This role deliberately",
+    "holds NO lambda:AddPermission, lambda:RemovePermission,",
+    "lambda:CreateFunctionUrlConfig, or lambda:UpdateFunctionUrlConfig. Creating",
+    "a Function URL, or changing its AuthType, CORS configuration, or",
+    "resource-based policy, requires administrator credentials and is performed",
+    "outside this host. Those settings decide who can reach the function at all:",
+    "the resource policy grants Principal '*', and AuthType NONE is what makes",
+    "the endpoint anonymous, so the dev role must not be able to alter either.",
+    "",
+    "Inspection is retained: lambda:GetFunctionUrlConfig reads the URL, AuthType,",
+    "and CORS settings, and lambda:GetPolicy reads the resource policy back. A",
+    "session can verify the configuration in full; it just cannot change it. See",
+    "infrastructure/lambda-url-resource-policy.json for the statements and the",
+    "commands an administrator runs."
+  ],
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadIdentity",
+      "Effect": "Allow",
+      "Resource": "*",
+      "Action": [
+        "sts:GetCallerIdentity"
+      ]
+    },
+    {
+      "Sid": "ManageGracefulGutLambda",
+      "Effect": "Allow",
+      "Resource": "arn:aws:lambda:us-east-2:<AWS_ACCOUNT_ID>:function:graceful-gut-ai-dev-api",
+      "Action": [
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:GetFunctionUrlConfig",
+        "lambda:GetPolicy",
+        "lambda:ListTags",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:PutFunctionConcurrency",
+        "lambda:DeleteFunctionConcurrency",
+        "lambda:InvokeFunction"
+      ]
+    },
+    {
+      "Sid": "ReadAndManageGracefulGutLogs",
+      "Effect": "Allow",
+      "Resource": "arn:aws:logs:us-east-2:<AWS_ACCOUNT_ID>:log-group:/aws/lambda/graceful-gut-ai-dev-api:*",
+      "Action": [
+        "logs:DescribeLogStreams",
+        "logs:FilterLogEvents",
+        "logs:GetLogEvents",
+        "logs:PutRetentionPolicy",
+        "logs:TagLogGroup",
+        "logs:TagResource",
+        "logs:ListTagsForResource"
+      ]
+    },
+    {
+      "Sid": "ListLogGroups",
+      "Effect": "Allow",
+      "Resource": "*",
+      "Action": [
+        "logs:DescribeLogGroups"
+      ]
+    },
+    {
+      "Sid": "ReadAndPassLambdaExecutionRole",
+      "Effect": "Allow",
+      "Resource": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/GracefulGutAI-LambdaExecutionRole",
+      "Action": [
+        "iam:GetRole",
+        "iam:PassRole"
+      ]
+    }
+  ]
 }
