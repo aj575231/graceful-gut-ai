@@ -2,38 +2,55 @@
 
 The Function URL is ``AuthType: NONE``, so these behaviours are the only thing
 between the internet and the application.
+
+A deployed posture resolves its key from Secrets Manager, so the fixtures here
+install a fake-backed provider rather than setting ``GG_API_KEY`` -- which
+production now ignores. Where the secret *comes from* is covered in
+``test_secrets.py``; this module is about what the gate does with it.
 """
 
 from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import API_KEY_HEADER, DEVELOPMENT, PRODUCTION
 from app.main import ALLOWED_ORIGINS, create_app
+from app.secrets import SECRET_ID_ENV
 
 #: Not a secret. A fixed placeholder used only to exercise the comparison in
 #: ``require_api_key``; real keys never appear in this repository.
 PLACEHOLDER_KEY = "placeholder-not-a-real-key"
 
+#: An identifier, not a secret value.
+PLACEHOLDER_SECRET_ID = "graceful-gut-ai/dev/api-key-placeholder"
+
 
 @pytest.fixture
-def secured_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    """A client for a deployed-style app: gate enforced, key configured.
+def secured_client(
+    monkeypatch: pytest.MonkeyPatch, install_secret: Callable[..., Any]
+) -> TestClient:
+    """A client for a deployed-style app: gate enforced, secret resolvable.
 
     Every AWS deployment runs ``APP_ENV=production``, so that is the posture
     under test here.
     """
     monkeypatch.setenv("APP_ENV", PRODUCTION)
-    monkeypatch.setenv("GG_API_KEY", PLACEHOLDER_KEY)
+    monkeypatch.setenv(SECRET_ID_ENV, PLACEHOLDER_SECRET_ID)
+    install_secret(json.dumps({"api_key": PLACEHOLDER_KEY}))
     return TestClient(create_app())
 
 
 @pytest.fixture
 def unconfigured_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    """A misconfigured deployment: gate enforced but no key set."""
+    """A misconfigured deployment: gate enforced but no secret to resolve."""
     monkeypatch.setenv("APP_ENV", PRODUCTION)
     monkeypatch.delenv("GG_API_KEY", raising=False)
+    monkeypatch.delenv(SECRET_ID_ENV, raising=False)
     return TestClient(create_app())
 
 
@@ -103,6 +120,7 @@ def test_only_development_relaxes_the_gate(
     """
     monkeypatch.setenv("APP_ENV", value)
     monkeypatch.delenv("GG_API_KEY", raising=False)
+    monkeypatch.delenv(SECRET_ID_ENV, raising=False)
     client = TestClient(create_app())
 
     assert client.get("/version").status_code == 503
@@ -112,6 +130,7 @@ def test_only_development_relaxes_the_gate(
 def test_unset_app_env_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("APP_ENV", raising=False)
     monkeypatch.delenv("GG_API_KEY", raising=False)
+    monkeypatch.delenv(SECRET_ID_ENV, raising=False)
 
     assert TestClient(create_app()).get("/version").status_code == 503
 

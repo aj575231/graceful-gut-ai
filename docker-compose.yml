@@ -7,6 +7,10 @@ services:
     ports:
       - "8000:8000"
     environment:
+      # Local development posture: the shared secret comes from GG_API_KEY, so
+      # this container needs no AWS credentials and never calls Secrets
+      # Manager. Any other APP_ENV here would require both, plus a
+      # GG_API_SECRET_ID -- and would not be a supported local setup.
       - APP_ENV=development
     restart: unless-stopped
     healthcheck:

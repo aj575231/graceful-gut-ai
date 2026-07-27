@@ -52,8 +52,8 @@ exactly two values:
 
 | Value | Where | Behaviour |
 | --- | --- | --- |
-| `production` | every AWS deployment | gate enforced, `/openapi.json` hidden, fails closed |
-| `development` | local machines only | unauthenticated access allowed when no key is set, `/openapi.json` exposed |
+| `production` | every AWS deployment | gate enforced, secret read from Secrets Manager, `/openapi.json` hidden, fails closed |
+| `development` | local machines only | secret read from `GG_API_KEY`, unauthenticated access allowed when that is unset, `/openapi.json` exposed, never contacts AWS |
 
 Anything else — including a missing value, or the retired value `dev` — is
 treated as `production`. Never set `APP_ENV=development` on a deployed
@@ -67,17 +67,49 @@ All routes except `/health` require a shared secret header:
 curl -H "X-GG-Key: $GG_API_KEY" "$FUNCTION_URL/version"
 ```
 
-Set `GG_API_KEY` in your environment (see `.env.example`); generate a value
-with `openssl rand -hex 32`. No real key belongs in Git, in a script, in a
-test, or in documentation. Under `APP_ENV=development` with no key set, the
-header is not required — local development only.
+Where that secret comes from depends on the posture, and the two sources never
+mix:
+
+| Posture | Source | Notes |
+| --- | --- | --- |
+| `development` | `GG_API_KEY` environment variable | local only; needs no AWS credentials |
+| everything else | AWS Secrets Manager, named by `GG_API_SECRET_ID` | `GG_API_KEY` is ignored entirely |
+
+The secret is a JSON document with exactly one field:
+
+```json
+{ "api_key": "<the shared secret>" }
+```
+
+`GG_API_SECRET_ID` holds the secret's **name or ARN** — an identifier, not a
+credential, so it belongs in function configuration and deployment scripts. The
+value it points at does not: no real key belongs in Git, in a script, in a test,
+or in documentation. Generate one with `openssl rand -hex 32` and put it
+straight into Secrets Manager.
+
+Retrieval goes through AWS Lambda Powertools, which caches the secret for five
+minutes per warm container, so a burst of requests costs one `GetSecretValue`
+call. The execution role needs `secretsmanager:GetSecretValue` on that one
+secret and nothing more —
+see [`infrastructure/lambda-execution-secrets-policy.json`](infrastructure/lambda-execution-secrets-policy.json).
+
+**Resolution fails closed.** If `GG_API_SECRET_ID` is unset, Secrets Manager is
+unreachable, the payload is not JSON, or `api_key` is missing or empty, every
+gated route returns `503` with an opaque body. The response never names the
+secret identifier, the AWS error, or the cause, and the secret value is never
+logged.
 
 > **`X-GG-Key` is temporary internal-development protection.**
-> It is one static shared secret with no rotation, no per-caller identity, and
-> no rate limiting. **Do not embed it in the Squarespace browser client** or any
-> other browser-side code — anything shipped to a browser is public, and the key
-> would be visible in page source and network traces to every visitor. Use it
-> for `curl` and internal development only.
+> It is one static shared secret with no per-caller identity, no revocation, and
+> no rate limiting; rotation means writing a new value into Secrets Manager.
+> **It must never be embedded in Squarespace JavaScript**, in any other
+> browser-side or mobile code, in an iframe configuration, in a URL or query
+> string, or in any client-visible file. Anything shipped to a browser is
+> public: the key would be readable in page source, dev tools, and network
+> traces, handing any visitor full access to every non-public route. Moving it
+> into Secrets Manager keeps it out of the function's configuration — it does
+> **not** make it safe to ship to a client. Use it for `curl` and internal
+> development only.
 
 ### Before this endpoint can be public
 
@@ -138,23 +170,44 @@ interpreter, so you do not need 3.13 installed to produce a correct package.
 ## Build and deploy
 
 ```bash
-bash scripts/build-lambda.sh    # -> .build/lambda.zip
-bash scripts/deploy-lambda.sh   # build, upload, print CodeSha256, smoke test
+bash scripts/build-lambda.sh              # -> .build/lambda.zip
+bash scripts/deploy-lambda.sh             # build + validate config, NO upload
+bash scripts/deploy-lambda.sh --deploy    # validate, upload, smoke test
 ```
 
-Deployment is manual and requires AWS credentials for `us-east-2`. CI holds no
-AWS credentials and never deploys. Record the printed `CodeSha256` with the
-commit it was built from.
+**Deploying is opt-in.** With no arguments the script builds the package,
+checks the function's live configuration, and stops without uploading anything.
+Only `--deploy` uploads code. Deployment is manual and requires AWS credentials
+for `us-east-2`; CI holds no AWS credentials and never deploys. Record the
+printed `CodeSha256` with the commit it was built from.
 
-Set the function's environment before the first deploy — `APP_ENV` defaults to
-`production` and fails closed, so a function with no `GG_API_KEY` returns 503
-on every gated route:
+Validation runs **before** any upload and fails the run if `APP_ENV` is not
+`production`, if `GG_API_SECRET_ID` is unset, or if a stale `GG_API_KEY` is
+still sitting in the function's environment. If a deploy's smoke test fails,
+the script prints the previous `CodeSha256` and `RevisionId` along with the
+rollback command.
+
+The script never reads, prints, or logs the secret value, and it never calls
+`secretsmanager:GetSecretValue`. Point the function at its secret — an
+identifier only, no credential involved:
 
 ```bash
-aws lambda update-function-configuration \
-  --function-name graceful-gut-ai-dev-api --region us-east-2 \
-  --environment 'Variables={APP_ENV=production,GG_API_KEY=<your-key>}'
+export GG_API_SECRET_ID=graceful-gut-ai/dev/api-key
+bash scripts/deploy-lambda.sh --configure
 ```
+
+That sets `APP_ENV=production` and `GG_API_SECRET_ID`, and clears any stale
+`GG_API_KEY`. The secret **value** is written separately, by an administrator,
+and never passes through this repository:
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id graceful-gut-ai/dev/api-key --region us-east-2 \
+  --secret-string '{"api_key":"<your-key>"}'
+```
+
+Rotation is the same command with a new value — the running function picks it
+up within the five-minute cache window, with no redeploy.
 
 The account ID and the live Function URL are deliberately not checked in. Read
 them from AWS when you need them:

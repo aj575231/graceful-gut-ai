@@ -43,6 +43,7 @@ Function URL. `mangum` adapts ASGI to the Lambda event model.
 ```
 backend/app/main.py            FastAPI app, CORS, security middleware, routes
 backend/app/config.py          environment/security helpers (read per request)
+backend/app/secrets.py         Secrets Manager retrieval of the shared secret
 backend/app/lambda_handler.py  Mangum(app, lifespan="off") -> `handler`
 backend/tests/                 pytest suite
 scripts/build-lambda.sh        reproducible ZIP build into .build/
@@ -74,6 +75,7 @@ aws lambda get-function-url-config \
 | Log retention | 14 days |
 | Function URL | not stored here — see command above |
 | `APP_ENV` | `production` (every AWS deployment) |
+| `GG_API_SECRET_ID` | secret name or ARN — required on every deployment |
 | Tags | `Project=GracefulGutAI`, `Environment=Development`, `Owner=AJMoses`, `Business=GracefulHealth` |
 
 This host deploys using the instance role `GracefulGutAI-ClaudeDevRole`, whose
@@ -90,12 +92,48 @@ The Function URL is `AuthType: NONE`. Access is controlled in application code
 by a **shared secret header**, not by IAM. This was a deliberate trade-off to
 keep `curl` testing easy while the product has no user-facing endpoints.
 
-- Header: `X-GG-Key`, compared against env var `GG_API_KEY` using
-  `hmac.compare_digest`.
+- Header: `X-GG-Key`, compared with `hmac.compare_digest` — constant-time, so a
+  wrong key cannot be recovered by timing the rejection.
+- **Where the expected value comes from depends on the posture, and the two
+  sources never mix.** `development` reads `GG_API_KEY` from the local
+  environment. Every other posture ignores `GG_API_KEY` entirely and reads the
+  secret from AWS Secrets Manager. There is no fallback in either direction.
 - `/health` is **always exempt** — the `docker-compose` healthcheck and any
-  uptime probe depend on it. It exposes no sensitive data.
-- **Fail closed:** when the gate is enforced and `GG_API_KEY` is unset, requests
-  return **503**, never an open endpoint.
+  uptime probe depend on it. It never resolves a secret, so it stays up when
+  Secrets Manager does not.
+- **Fail closed:** when the gate is enforced and no secret can be resolved,
+  requests return **503**, never an open endpoint.
+
+### The shared secret lives in Secrets Manager
+
+Deployed postures read the key from Secrets Manager, so it never appears in the
+function's environment, in `get-function-configuration` output, in a deployment
+script, or in this repository.
+
+| Item | Value |
+| --- | --- |
+| Identifier env var | `GG_API_SECRET_ID` — a secret **name or ARN** |
+| Secret payload | JSON: `{"api_key": "<value>"}` |
+| Retrieval | AWS Lambda Powertools parameters utility, `transform="json"` |
+| Cache | 300 s per warm container, so a request burst costs one API call |
+| Execution-role permission | `secretsmanager:GetSecretValue` on that one secret |
+
+`GG_API_SECRET_ID` is an **identifier, not a credential**. It belongs in
+function configuration, deployment scripts, and CI output. The value it points
+at belongs in none of those.
+
+Resolution fails closed on every fault — identifier unset, retrieval denied or
+throttled, payload not JSON, `api_key` missing, empty, or not a string. Each
+one produces the **same** opaque 503. The response body never carries the
+secret identifier, the AWS error, a stack trace, or the value; the log records
+a short reason and an exception *type* only, never the value. `backend/app/secrets.py`
+holds this logic, and `backend/tests/test_secrets.py` covers every failure mode.
+
+The Powertools provider is injectable (`app.secrets.set_provider`) so tests
+exercise real caching and JSON-transform behaviour against a fake boto3 client.
+`backend/tests/conftest.py` turns any attempt to construct a real AWS client
+into a test failure: **the suite never reaches AWS and never handles a real
+secret.**
 
 ### `APP_ENV` — exactly two values
 
@@ -104,10 +142,13 @@ legal values and no others:
 
 | Value | Where | Behaviour |
 | --- | --- | --- |
-| `production` | **every** AWS deployment, whatever stage it represents | gate enforced, `/openapi.json` hidden, fails closed |
-| `development` | local machines only — never a deployed function | permits unauthenticated access when no key is set, exposes `/openapi.json` |
+| `production` | **every** AWS deployment, whatever stage it represents | gate enforced, secret from Secrets Manager, `GG_API_KEY` ignored, `/openapi.json` hidden, fails closed |
+| `development` | local machines only — never a deployed function | secret from `GG_API_KEY`, permits unauthenticated access when it is unset, exposes `/openapi.json`, never contacts AWS |
 
-- `development` is the **only** value that relaxes security.
+- `development` is the **only** value that relaxes security, and the only one
+  that reads `GG_API_KEY`. Setting `GG_API_KEY` on a deployed function does not
+  grant access — it just leaves a credential in plain text for no benefit.
+  `scripts/deploy-lambda.sh` fails the run if it finds one.
 - Anything else — including a missing `APP_ENV` — is treated as `production`.
   That is a safety net, not a supported configuration.
 - **`dev` is retired.** It was previously set on the deployed function. Do not
@@ -118,13 +159,20 @@ legal values and no others:
 ### `X-GG-Key` is temporary, internal-only
 
 `X-GG-Key` is **temporary internal-development protection**, not a public
-authentication mechanism. It is a single shared static secret with no rotation,
-no per-caller identity, no revocation, and no rate limiting.
+authentication mechanism. It is a single shared static secret with no
+per-caller identity, no revocation, and no rate limiting. Moving it into
+Secrets Manager changed **where the value is stored** and nothing else: it is
+still one static key shared by every caller.
 
-- **It must never be embedded in the Squarespace browser client**, or in any
-  other browser-side or mobile code. Anything shipped to a browser is public:
+- **It must never be embedded in any client-visible surface.** Not in
+  Squarespace JavaScript, not in any other browser-side or mobile code, not in
+  an iframe configuration, not in a URL or query string, not in a template, and
+  not in any file served to a client. Anything shipped to a browser is public:
   the key would be readable in page source, dev tools, and network traces, and
   would hand any visitor full access to every non-public route.
+- Storing it in Secrets Manager does **not** make it safe to ship to a client.
+  A key read from Secrets Manager and then rendered into a page is exactly as
+  exposed as one pasted there by hand.
 - It is for `curl`, CI-adjacent checks, and internal development only.
 - It is not a substitute for the public-endpoint controls below.
 
@@ -242,6 +290,16 @@ above. Do not add them back. The read-only counterparts,
 `lambda:GetFunctionUrlConfig` and `lambda:GetPolicy`, are deliberately kept so
 verification still works without admin credentials.
 
+**This role holds no Secrets Manager permissions at all**, and must not be
+given any. It can point the function at a secret — `GG_API_SECRET_ID` is an
+identifier and goes in via `lambda:UpdateFunctionConfiguration` — but it cannot
+read the value. Granting `secretsmanager:GetSecretValue` here would undo the
+point of Phase 1D: the secret moved out of the function's environment precisely
+so that a session which can deploy code cannot also read the live key. Reading
+the secret is the **Lambda execution role's** job, not this host's.
+`backend/tests/test_infrastructure_policy.py` fails if any `secretsmanager:`
+action appears in the dev policy, wildcards included.
+
 Note that `iam:PassRole` is scoped to a single role, so this host cannot attach
 a more privileged execution role to the function. `GracefulGutAI-LambdaExecutionRole`'s
 own attached policies are not readable from the dev role and remain unaudited —
@@ -272,27 +330,64 @@ variable **names** only.
 | Variable | Where it lives | Purpose |
 | --- | --- | --- |
 | `APP_ENV` | Lambda env vars / `.env` / `docker-compose.yml` | selects the security posture |
-| `GG_API_KEY` | Lambda env vars / `.env` | shared secret for `X-GG-Key` |
+| `GG_API_SECRET_ID` | Lambda env vars | **identifier** of the Secrets Manager secret — not a credential |
+| `GG_API_KEY` | `.env` on a local machine only | shared secret for `X-GG-Key` under `APP_ENV=development`; ignored everywhere else |
 
-No real `GG_API_KEY` value may appear in Git, shell scripts, test fixtures,
-documentation, audit reports, or the deployment ZIP. Generate one yourself and
-set it directly on the function:
+No real shared-secret value may appear in Git, shell scripts, test fixtures,
+documentation, audit reports, Lambda environment variables, or the deployment
+ZIP. On a deployment it lives in Secrets Manager and nowhere else.
+
+Point the function at its secret — no credential passes through this step, so
+this host can do it:
 
 ```bash
-# generate a key; do not paste the output into any file in this repository
+export GG_API_SECRET_ID=graceful-gut-ai/dev/api-key
+bash scripts/deploy-lambda.sh --configure
+```
+
+Write the value itself directly into the secret. Generate it yourself and do
+not paste the output into any file in this repository:
+
+```bash
 openssl rand -hex 32
 
-aws lambda update-function-configuration \
-  --function-name graceful-gut-ai-dev-api --region us-east-2 \
-  --environment 'Variables={APP_ENV=production,GG_API_KEY=<your-key>}'
+aws secretsmanager put-secret-value \
+  --secret-id graceful-gut-ai/dev/api-key --region us-east-2 \
+  --secret-string '{"api_key":"<your-key>"}'
 ```
+
+Rotate by rerunning `put-secret-value` with a new value. The running function
+picks it up within the 300-second cache window — no redeploy, no configuration
+change. That is a real improvement on the previous scheme, but it is still one
+static key shared by all callers, which is why `X-GG-Key` still cannot serve a
+public endpoint.
 
 Also keep account IDs, instance IDs, and live Function URLs out of the
 repository — read them from AWS at the point of use.
 
-Rotate the key by rerunning the command with a new value; there is no other
-rotation mechanism, which is one reason `X-GG-Key` cannot serve a public
-endpoint.
+### Administrator actions for the secret
+
+Creating the secret and granting the execution role access are **outside this
+host's permissions** — the dev role holds no `secretsmanager:*` and no IAM
+write actions. An administrator runs these once:
+
+```bash
+# 1. Create the secret. Generate the key yourself; it is never stored here.
+aws secretsmanager create-secret \
+  --name graceful-gut-ai/dev/api-key --region us-east-2 \
+  --description "X-GG-Key shared secret for graceful-gut-ai-dev-api" \
+  --secret-string '{"api_key":"<your-key>"}'
+
+# 2. Let the execution role read that one secret, and nothing else.
+#    Substitute <AWS_ACCOUNT_ID> and <AWS_REGION> first.
+aws iam put-role-policy \
+  --role-name GracefulGutAI-LambdaExecutionRole \
+  --policy-name GracefulGutAI-ReadApiKeySecret \
+  --policy-document file://infrastructure/lambda-execution-secrets-policy.json
+```
+
+Until both are done, a deployed function returns 503 on every gated route —
+correctly, since it cannot resolve a secret.
 
 ---
 
@@ -322,12 +417,25 @@ the local 3.12 pip, so building a correct package does **not** require a local
 ### Deploying
 
 ```bash
-bash scripts/deploy-lambda.sh
+bash scripts/deploy-lambda.sh              # build + validate only, NO upload
+bash scripts/deploy-lambda.sh --configure  # set APP_ENV + GG_API_SECRET_ID
+bash scripts/deploy-lambda.sh --deploy     # validate, upload, smoke test
 ```
 
-This builds `.build/lambda.zip`, uploads it, prints the resulting
-`CodeSha256`, and smoke-tests the live URL. Record the `CodeSha256` alongside
+**Uploading is opt-in.** The bare invocation builds the package, validates the
+live configuration, and stops. Only `--deploy` sends code.
+
+Validation runs before any upload and fails on: `APP_ENV` not `production`,
+`GG_API_SECRET_ID` unset, or a stale `GG_API_KEY` still present in the
+function's environment. A failed smoke test prints the pre-deploy `CodeSha256`
+and `RevisionId` with the rollback command. Record the `CodeSha256` alongside
 the commit so a deployment can always be tied back to source.
+
+The script never reads, prints, or logs the secret value and never calls
+`secretsmanager:GetSecretValue` — it accepts only the identifier. The smoke
+test makes no keyed request; an unauthenticated `401` is the stronger signal
+anyway, since it proves the function reached Secrets Manager and found a usable
+`api_key`, where `503` means resolution failed.
 
 Deploy is **manual on purpose** — CI holds no AWS credentials.
 
