@@ -5,7 +5,15 @@
     "time; it is deliberately not stored in this repository.",
     "",
     "This copy is documentation only -- the dev role cannot modify IAM. Applying",
-    "it requires admin credentials."
+    "it requires admin credentials.",
+    "",
+    "This role deliberately holds NO lambda:AddPermission or",
+    "lambda:RemovePermission. Function URL resource-policy statements are",
+    "administrator-only: they grant Principal '*' and can re-open the function to",
+    "anyone, so they must be applied, repaired, or removed with administrator",
+    "credentials, never from this host. See",
+    "infrastructure/lambda-url-resource-policy.json for the statements and the",
+    "commands an administrator runs."
   ],
   "Version": "2012-10-17",
   "Statement": [
@@ -31,8 +39,6 @@
         "lambda:UpdateFunctionConfiguration",
         "lambda:PutFunctionConcurrency",
         "lambda:DeleteFunctionConcurrency",
-        "lambda:AddPermission",
-        "lambda:RemovePermission",
         "lambda:CreateFunctionUrlConfig",
         "lambda:UpdateFunctionUrlConfig",
         "lambda:InvokeFunction"

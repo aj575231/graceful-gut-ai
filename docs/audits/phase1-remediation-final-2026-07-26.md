@@ -176,6 +176,9 @@ docs/audits/phase1-infrastructure-audit-2026-07-26.md
 
 ## Remaining blockers before deployment
 
+> **Updated 2026-07-27.** Blocker 1 is resolved and blocker 5's first bullet is
+> done. See the addendum at the end of this report.
+
 1. **The dev Function URL is still down (403).** Both permission statements
    must be applied. This requires `lambda:AddPermission` with
    `--principal '*'`, which the permission classifier blocks — **run it
@@ -221,9 +224,9 @@ docs/audits/phase1-infrastructure-audit-2026-07-26.md
    repository is ever made public, rewrite history or rotate the URL first.
 
 5. **IAM follow-ups, unchanged and still open.**
-   - Drop `lambda:AddPermission` from
+   - ~~Drop `lambda:AddPermission` from
      `infrastructure/claude-dev-deployment-policy.json` once the URL policy is
-     stable — it currently lets this host re-open the function to any principal.
+     stable~~ — done 2026-07-27, see the addendum.
    - Apply the updated `claude-dev-deployment-policy.json` with admin
      credentials; the repository copy is documentation only.
    - Review `GracefulGutAI-LambdaExecutionRole` separately — its attached
@@ -239,3 +242,85 @@ docs/audits/phase1-infrastructure-audit-2026-07-26.md
 smoke test, so the value is briefly visible in the local process list. It is
 never written to a file or printed. Worth revisiting if the script ever runs on
 a shared host.
+
+---
+
+## Addendum — 2026-07-27: dev-role permissions restricted
+
+**Nothing was deployed. No AWS resource was created, modified, or deleted by
+this change.** It is a repository-only edit to the reference IAM policy and the
+documentation around it.
+
+### Context
+
+The dev Function URL resource policy was restored manually by the owner using
+administrator credentials, closing blocker 1 above. With the policy back in
+place, the standing IAM follow-up could be closed.
+
+### Change
+
+`lambda:AddPermission` and `lambda:RemovePermission` were removed from the
+`ManageGracefulGutLambda` statement in
+`infrastructure/claude-dev-deployment-policy.json`.
+
+**Function URL resource-policy changes now require administrator action.** Both
+statements in `infrastructure/lambda-url-resource-policy.json` grant
+`Principal: '*'`; applying, repairing, or removing either one is an
+administrator task performed outside this host.
+`GracefulGutAI-ClaudeDevRole` will receive `AccessDeniedException` if a session
+attempts one. A session that finds the URL returning 403 should report it and
+stop — the repair is not its to make. Verification is unaffected:
+`lambda:GetPolicy` is retained, so a session can still read the live policy back
+and confirm both statements are present.
+
+Recorded in `CLAUDE.md` (new "Dev-role permissions" section, replacing the
+"Known IAM follow-up" note) and in the `_comment` blocks of both
+`infrastructure/*.json` policy files.
+
+### Confirmed scope of `GracefulGutAI-ClaudeDevRole`
+
+After the removal, the reference policy grants exactly the capabilities the
+role needs and nothing further:
+
+| Capability | Actions | Resource scope |
+| --- | --- | --- |
+| Inspect the function | `lambda:GetFunction`, `GetFunctionConfiguration`, `GetFunctionUrlConfig`, `GetPolicy`, `ListTags` | the dev function ARN only |
+| Update code and configuration | `lambda:UpdateFunctionCode`, `UpdateFunctionConfiguration`, `PutFunctionConcurrency`, `DeleteFunctionConcurrency`, `CreateFunctionUrlConfig`, `UpdateFunctionUrlConfig` | the dev function ARN only |
+| Invoke the function | `lambda:InvokeFunction` | the dev function ARN only |
+| Read and configure logs | `logs:DescribeLogStreams`, `FilterLogEvents`, `GetLogEvents`, `PutRetentionPolicy`, `TagLogGroup`, `TagResource`, `ListTagsForResource` | the function's log group only |
+| Pass the execution role | `iam:GetRole`, `iam:PassRole` | `GracefulGutAI-LambdaExecutionRole` only |
+
+Two grants are on `Resource: "*"` and are intentional: `sts:GetCallerIdentity`,
+which takes no resource, and `logs:DescribeLogGroups`, which cannot be
+resource-scoped by IAM. Neither reads data.
+
+No IAM write actions remain. `iam:PassRole` is pinned to the single execution
+role, so this host cannot attach a more privileged role to the function.
+
+### Noted, not changed
+
+`lambda:CreateFunctionUrlConfig` and `lambda:UpdateFunctionUrlConfig` are still
+granted. They configure the URL endpoint itself — auth type and CORS — and are
+distinct from the resource policy, but `UpdateFunctionUrlConfig` could in
+principle change `AuthType`. They were left in place because deploy tooling may
+need them; drop them too if the Function URL configuration is considered final.
+Flagged for an owner decision, not acted on.
+
+`GracefulGutAI-LambdaExecutionRole` remains unaudited — its attached policies
+are still not readable from the dev role.
+
+### Apply step, still outstanding
+
+The repository copy is documentation. The narrowed policy must be applied to
+the live role with administrator credentials before the removal takes effect;
+until then the live role still holds `lambda:AddPermission`.
+
+### Verification
+
+| Check | Result |
+| --- | --- |
+| `python -m pytest -q` | **32 passed**, 2 warnings |
+| `ruff check backend/` | **All checks passed!** |
+| `ruff format --check backend/` | **8 files already formatted** |
+| `git diff --check` | clean |
+| Both policy files parse as valid JSON | yes |

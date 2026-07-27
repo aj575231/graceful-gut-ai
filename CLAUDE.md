@@ -167,7 +167,14 @@ route if either is missing:
 | `GracefulGutPublicInvokeUrl` | `lambda:InvokeFunctionUrl` | function URL auth type `NONE` |
 | `GracefulGutPublicInvokeFunction` | `lambda:InvokeFunction` | `lambda:InvokedViaFunctionUrl` |
 
-Both are applied with the AWS CLI:
+**Changing this policy requires administrator credentials.** Both statements
+grant `Principal: '*'`, so applying, repairing, or removing either one is an
+administrator action performed outside this host. `GracefulGutAI-ClaudeDevRole`
+holds neither `lambda:AddPermission` nor `lambda:RemovePermission` and will get
+`AccessDeniedException` if a session tries. A session that finds the URL
+returning 403 should report it and stop, not attempt a repair.
+
+The commands an administrator runs:
 
 ```bash
 aws lambda add-permission \
@@ -194,11 +201,30 @@ it, taking the dev URL down. It appears healthy for ~10–20 seconds after
 removal because of policy caching, which is what misled that audit. Verify with
 `aws lambda get-policy`, not with a single immediate `curl`.
 
-### Known IAM follow-up
+### Dev-role permissions — what this host may and may not do
 
-`infrastructure/claude-dev-deployment-policy.json` grants
-`lambda:AddPermission`, which lets this host re-open the function to any
-principal. Drop it once the URL resource policy is final and stable.
+`infrastructure/claude-dev-deployment-policy.json` is the reference copy of the
+policy on `GracefulGutAI-ClaudeDevRole`. It is scoped to exactly this:
+
+| Capability | Actions | Resource |
+| --- | --- | --- |
+| Identity check | `sts:GetCallerIdentity` | `*` |
+| Inspect the function | `lambda:GetFunction`, `GetFunctionConfiguration`, `GetFunctionUrlConfig`, `GetPolicy`, `ListTags` | the dev function only |
+| Update code and configuration | `lambda:UpdateFunctionCode`, `UpdateFunctionConfiguration`, `PutFunctionConcurrency`, `DeleteFunctionConcurrency`, `CreateFunctionUrlConfig`, `UpdateFunctionUrlConfig` | the dev function only |
+| Invoke | `lambda:InvokeFunction` | the dev function only |
+| Read and configure logs | `logs:DescribeLogStreams`, `FilterLogEvents`, `GetLogEvents`, `PutRetentionPolicy`, `TagLogGroup`, `TagResource`, `ListTagsForResource` (plus `DescribeLogGroups` on `*`, which cannot be resource-scoped) | the function's log group only |
+| Pass the execution role | `iam:GetRole`, `iam:PassRole` | `GracefulGutAI-LambdaExecutionRole` only |
+
+`lambda:AddPermission` and `lambda:RemovePermission` were **removed** — the
+resource policy is administrator-only, as described above. Do not add them back.
+
+The role can still read the live resource policy with `lambda:GetPolicy`, which
+is what verification needs; it just cannot change it.
+
+Note that `iam:PassRole` is scoped to a single role, so this host cannot attach
+a more privileged execution role to the function. `GracefulGutAI-LambdaExecutionRole`'s
+own attached policies are not readable from the dev role and remain unaudited —
+review them separately with admin credentials.
 
 ---
 
