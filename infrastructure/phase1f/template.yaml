@@ -1,0 +1,813 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# Phase 1F -- administrator-controlled infrastructure stack.
+#
+# This stack owns the public entry point and the controls in front of it: the
+# Regional REST API, its stage and deployment, the WAF Web ACL and its
+# association, the access-log group, and the Lambda resource-policy statements
+# that let this API -- and only this API -- invoke the function.
+#
+# It does NOT own the application. The Lambda function is referenced by ARN
+# through a parameter and is never declared, replaced, reconfigured, or given a
+# reserved-concurrency setting here. Code and function configuration stay with
+# the restricted application deployment path, which is what keeps setting
+# reserved concurrency to 0 -- the emergency kill switch -- available without an
+# administrator. See infrastructure/phase1f/administrator-runbook.md.
+#
+# Nothing here has been applied. No AWS resource was created, read, or modified
+# to produce this file.
+
+Transform: AWS::Serverless-2016-10-31
+
+Description: >-
+  Graceful Gut AI -- Regional REST API, WAF Web ACL, and access logging in
+  front of an existing application Lambda. Administrator-controlled. The public
+  education route is disabled by default.
+
+# ---------------------------------------------------------------------------
+# The CORS contract.
+#
+# CORS is enforced in exactly ONE place: the application, which already runs
+# Starlette's CORSMiddleware. Configuring it here as well would create two
+# sources of truth that drift, and the failure mode -- a preflight answered by
+# the gateway with a policy the application does not share -- is confusing to
+# diagnose. See docs/architecture/phase1e-api-gateway-adr.md section 8.
+#
+# So this block is a *contract*, not an enforced resource. CloudFormation
+# ignores Metadata entirely. It is tracked here because the application
+# deployment path needs a single reviewed source for these values, and because
+# backend/tests/test_phase1f_foundation.py asserts against it -- a wildcard
+# origin or a browser-visible credential header fails the suite before it can
+# reach a template that an administrator would apply.
+#
+# The origins themselves are stack Parameters and are exported as an Output, so
+# they flow infrastructure -> application and never the reverse.
+# ---------------------------------------------------------------------------
+Metadata:
+  GracefulGutCorsContract:
+    Enforcement: application
+    AllowCredentials: false
+    AllowedMethods:
+      - GET
+      - POST
+      - OPTIONS
+    AllowedRequestHeaders:
+      - Content-Type
+    ExposedResponseHeaders: []
+    PreflightMaxAgeSeconds: 600
+    WildcardOriginPermitted: false
+    # X-GG-Key is deliberately absent. It is a single static shared secret; a
+    # browser that is invited to send it is a browser that has been given it.
+    BrowserVisibleCredentialHeaders: []
+
+Parameters:
+  # -- The existing application, referenced and never managed ----------------
+
+  ApplicationFunctionArn:
+    Type: String
+    Description: >-
+      ARN of the EXISTING application Lambda. This stack references it; it
+      never declares, replaces, or reconfigures the function.
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:[0-9]{12}:function:[a-zA-Z0-9-_]+$"
+    ConstraintDescription: must be a fully qualified Lambda function ARN
+
+  # -- Stage --------------------------------------------------------------
+
+  StageName:
+    Type: String
+    Default: dev
+    Description: Explicit stage name. One stage per stack.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{0,63}$"
+
+  AccessLogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: >-
+      Retention for the API Gateway access log group. 14 days for application
+      logs, 30 maximum for anything security-relevant.
+    AllowedValues: [1, 3, 5, 7, 14, 30]
+
+  # -- CORS origins, supplied at deployment time and never committed --------
+
+  ProductionOrigin:
+    Type: String
+    Description: >-
+      The exact HTTPS production origin (scheme and host only, no path, no
+      trailing slash, no wildcard). Supplied at deployment time; the real value
+      is never committed to this repository.
+    AllowedPattern: "^https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+    ConstraintDescription: >-
+      must be an exact https origin -- scheme and host only, with no wildcard,
+      no path, no port, and no plain http
+
+  DevelopmentOrigin:
+    Type: String
+    Default: ""
+    Description: >-
+      One separately approved development origin, or empty. Loopback is the one
+      place plain http is acceptable, because it never leaves the machine.
+    AllowedPattern: "^$|^https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$|^http://(localhost|127\\.0\\.0\\.1)(:[0-9]{1,5})?$"
+    ConstraintDescription: >-
+      must be empty, an exact https origin, or a loopback origin -- never a
+      wildcard
+
+  # -- The public education route, off unless deliberately turned on ---------
+
+  EnableEducationRoute:
+    Type: String
+    Default: "false"
+    AllowedValues: ["false", "true"]
+    Description: >-
+      Creates POST /v1/education/ask and its preflight method. Default false.
+      Turning this on does not by itself satisfy the CLAUDE.md release gate --
+      the launch-blocking legal and model-provider determinations, and a real
+      authentication decision, come first.
+
+  # -- Throttling. Starting points to be raised on evidence, not targets. ----
+
+  StageThrottleRateLimit:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Steady-state requests per second across the whole stage.
+
+  StageThrottleBurstLimit:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Burst capacity across the whole stage.
+
+  HealthRouteRateLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: GET /health steady rate. Cheap, no model spend, probed often.
+
+  HealthRouteBurstLimit:
+    Type: Number
+    Default: 40
+    MinValue: 1
+
+  EducationRouteRateLimit:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: >-
+      POST /v1/education/ask steady rate. The only route that costs model
+      spend, so the tightest limit.
+
+  EducationRouteBurstLimit:
+    Type: Number
+    Default: 2
+    MinValue: 1
+
+  # -- WAF rate limits ------------------------------------------------------
+  #
+  # AWS WAF will not accept a rate-based limit below 100 per evaluation window.
+  # The ADR proposes 40 and 60 requests per five minutes for the chat route;
+  # neither is expressible as a WAF rate-based rule. The floor is enforced here
+  # by MinValue so the constraint fails at template validation rather than at
+  # apply time, and the gap is recorded as an open item in the runbook.
+
+  WafOverallRateLimit:
+    Type: Number
+    Default: 300
+    MinValue: 100
+    MaxValue: 2000000000
+    Description: Requests per source IP per five minutes across the whole API.
+
+  WafEducationRouteRateLimit:
+    Type: Number
+    Default: 100
+    MinValue: 100
+    MaxValue: 2000000000
+    Description: >-
+      Requests per source IP per five minutes against the education route.
+      100 is the AWS minimum, not a chosen value.
+
+  WafRateRuleAction:
+    Type: String
+    Default: Count
+    AllowedValues: [Count, Block]
+    Description: >-
+      Rate-based rules deploy in Count so a rollout can be observed before it
+      can reject anyone. Must be Block before the education route carries
+      public traffic -- a rate rule in Count protects nothing.
+
+Conditions:
+  EducationRouteEnabled: !Equals [!Ref EnableEducationRoute, "true"]
+  HasDevelopmentOrigin: !Not [!Equals [!Ref DevelopmentOrigin, ""]]
+  RateRulesBlock: !Equals [!Ref WafRateRuleAction, "Block"]
+
+Resources:
+  # =========================================================================
+  # The REST API and its routes.
+  #
+  # Every resource and method is declared explicitly. There is deliberately no
+  # {proxy+} greedy path: a proxy resource would expose the application's whole
+  # route table -- /, /version, and any future endpoint -- through one line of
+  # template, which is the opposite of a minimum public surface.
+  # =========================================================================
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub graceful-gut-ai-${StageName}-api
+      Description: >-
+        Public entry point for Graceful Gut AI. Educational content only.
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      # No BinaryMediaTypes: the API accepts and returns JSON only.
+      Tags:
+        - { Key: Project, Value: GracefulGutAI }
+        - { Key: Environment, Value: Development }
+        - { Key: Owner, Value: AJMoses }
+        - { Key: Business, Value: GracefulHealth }
+
+  # -- GET /health ----------------------------------------------------------
+
+  HealthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: health
+
+  HealthGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref HealthResource
+      HttpMethod: GET
+      # Anonymous by design: there are no accounts, so there is no user to
+      # authenticate. Abuse control is the whole of the defence.
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApplicationFunctionArn}/invocations
+
+  # Preflight is answered by the application, not by the gateway, so that CORS
+  # has one owner. On a REST API this only works if OPTIONS is wired to the
+  # same integration -- otherwise API Gateway answers it itself, typically with
+  # 403, and the preflight fails before the application is consulted.
+  HealthOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref HealthResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApplicationFunctionArn}/invocations
+
+  # -- POST /v1/education/ask -- created only when explicitly enabled --------
+
+  V1Resource:
+    Type: AWS::ApiGateway::Resource
+    Condition: EducationRouteEnabled
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: v1
+
+  EducationResource:
+    Type: AWS::ApiGateway::Resource
+    Condition: EducationRouteEnabled
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref V1Resource
+      PathPart: education
+
+  EducationAskResource:
+    Type: AWS::ApiGateway::Resource
+    Condition: EducationRouteEnabled
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref EducationResource
+      PathPart: ask
+
+  # Validation is off by default on a method, and a model attached without it
+  # does nothing at all. Both flags are set deliberately.
+  EducationRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Condition: EducationRouteEnabled
+    Properties:
+      RestApiId: !Ref RestApi
+      Name: validate-body-and-parameters
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  EducationAskModel:
+    Type: AWS::ApiGateway::Model
+    Condition: EducationRouteEnabled
+    Properties:
+      RestApiId: !Ref RestApi
+      Name: EducationAskRequest
+      ContentType: application/json
+      # API Gateway validates against JSON Schema draft-04.
+      #
+      # maxLength counts CHARACTERS. It is not a body-size cap and cannot be
+      # one -- JSON Schema has no body-size keyword. Body size is capped by the
+      # WAF SizeConstraint rule below, and the application checks UTF-8 byte
+      # size and character length separately, because 2,000 multi-byte
+      # characters can exceed 4,096 bytes while passing a character count.
+      Schema:
+        $schema: "http://json-schema.org/draft-04/schema#"
+        title: EducationAskRequest
+        type: object
+        required:
+          - message
+        additionalProperties: false
+        properties:
+          message:
+            type: string
+            minLength: 1
+            maxLength: 2000
+
+  EducationAskPostMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: EducationRouteEnabled
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref EducationAskResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref EducationRequestValidator
+      RequestParameters:
+        # Required, so a request omitting Content-Type is rejected by the
+        # validator rather than reaching the integration.
+        method.request.header.Content-Type: true
+      RequestModels:
+        application/json: !Ref EducationAskModel
+        # $default closes a real gap: API Gateway SKIPS body validation when no
+        # model matches the request's content type. Without this key, a body
+        # sent as text/plain is forwarded unvalidated. PassthroughBehavior does
+        # not close it for an AWS_PROXY integration -- see the note below.
+        $default: !Ref EducationAskModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        # Set as specified, and honest about what it does: PassthroughBehavior
+        # governs unmapped content types for integrations that use
+        # RequestTemplates. AWS_PROXY has none and always passes the whole
+        # request through, so this is inert here. The $default model above is
+        # what actually closes the validation gap, and returning 415 for a
+        # wrong content type is the application's job on a proxy integration.
+        PassthroughBehavior: NEVER
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApplicationFunctionArn}/invocations
+
+  EducationAskOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: EducationRouteEnabled
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref EducationAskResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApplicationFunctionArn}/invocations
+
+  # =========================================================================
+  # Explicit deployment and explicit stage.
+  #
+  # An AWS::ApiGateway::Deployment is immutable once created. CloudFormation
+  # will not replace it when a method changes, so a later template change to a
+  # route does NOT reach callers until a new deployment is created. That is a
+  # documented manual step in the runbook, and it is exactly the one API
+  # Gateway action the restricted deployment policy already grants
+  # (apigateway:POST on /restapis/<API_ID>/deployments).
+  # =========================================================================
+
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    # Only the unconditional methods are listed. CloudFormation's DependsOn is
+    # a literal list of logical IDs and takes no Fn::If, so naming the
+    # conditional education methods here would tie the default deployment to
+    # resources that do not exist. The consequence is explicit and handled
+    # operationally: enabling the education route requires a new deployment
+    # afterwards, exactly like any other route change.
+    DependsOn:
+      - HealthGetMethod
+      - HealthOptionsMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: !Sub Initial deployment for stage ${StageName}
+      # Deliberately no StageName here: setting it would make this resource
+      # create its own stage, and the stage below is the explicit one.
+
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/graceful-gut-ai/${StageName}/access
+      RetentionInDays: !Ref AccessLogRetentionDays
+
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref Deployment
+      StageName: !Ref StageName
+      Description: !Sub Explicit stage ${StageName}
+      TracingEnabled: false
+      AccessLogSetting:
+        DestinationArn: !GetAtt AccessLogGroup.Arn
+        # Every field here is either server-generated or an enumerated
+        # protocol value. There is no source IP, no user agent, no header, no
+        # query string, no request or response body, and no free text. That is
+        # the whole reason the format is written out rather than left at a
+        # default -- API Gateway's common formats include
+        # $context.identity.sourceIp.
+        Format: >-
+          {"requestId":"$context.requestId","timestamp":"$context.requestTime","route":"$context.resourcePath","status":"$context.status","integrationStatus":"$context.integration.status","latencyMs":"$context.responseLatency","responseLength":"$context.responseLength"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: !Ref StageThrottleRateLimit
+          ThrottlingBurstLimit: !Ref StageThrottleBurstLimit
+          MetricsEnabled: true
+          # ERROR, never INFO: execution logging is for faults, not traffic.
+          LoggingLevel: ERROR
+          # The single most important line in this block. DataTrace logging
+          # writes full request and response bodies to CloudWatch, which would
+          # put user health text in a log the moment the education route is
+          # enabled. It is never turned on, on any route, in any environment.
+          DataTraceEnabled: false
+        - ResourcePath: /health
+          HttpMethod: GET
+          ThrottlingRateLimit: !Ref HealthRouteRateLimit
+          ThrottlingBurstLimit: !Ref HealthRouteBurstLimit
+          MetricsEnabled: true
+          LoggingLevel: ERROR
+          DataTraceEnabled: false
+        - !If
+          - EducationRouteEnabled
+          - ResourcePath: /v1/education/ask
+            HttpMethod: POST
+            ThrottlingRateLimit: !Ref EducationRouteRateLimit
+            ThrottlingBurstLimit: !Ref EducationRouteBurstLimit
+            MetricsEnabled: true
+            LoggingLevel: ERROR
+            DataTraceEnabled: false
+          - !Ref AWS::NoValue
+      Tags:
+        - { Key: Project, Value: GracefulGutAI }
+        - { Key: Environment, Value: Development }
+        - { Key: Owner, Value: AJMoses }
+        - { Key: Business, Value: GracefulHealth }
+
+  # =========================================================================
+  # Lambda invocation permission, one statement per method.
+  #
+  # Each SourceArn names this API, this stage, this method, and this path. A
+  # statement scoped only to the function would let any API in the account
+  # invoke it; a statement scoped to the API but not the method would survive a
+  # route being added.
+  # =========================================================================
+
+  HealthGetInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApplicationFunctionArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/${StageName}/GET/health
+
+  HealthOptionsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApplicationFunctionArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/${StageName}/OPTIONS/health
+
+  EducationAskPostInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EducationRouteEnabled
+    Properties:
+      FunctionName: !Ref ApplicationFunctionArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/${StageName}/POST/v1/education/ask
+
+  EducationAskOptionsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EducationRouteEnabled
+    Properties:
+      FunctionName: !Ref ApplicationFunctionArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/${StageName}/OPTIONS/v1/education/ask
+
+  # =========================================================================
+  # AWS WAF.
+  #
+  # Deployed count-first. Managed rule groups start in Count, sampled traffic
+  # is reviewed, and a group moves to Block only once it demonstrably does not
+  # fire on legitimate traffic. Ordinary descriptions of gut symptoms trip
+  # SQLi and XSS heuristics -- "Crohn's disease" contains the apostrophe those
+  # rules weight most heavily, and "a sudden drop in appetite" contains a SQL
+  # keyword. Blocking a user describing their symptoms is a product failure,
+  # not a security win.
+  #
+  # The two rules that do NOT start in Count are the two that cannot produce a
+  # false positive on prose: a body-size ceiling and a method allow-list.
+  # =========================================================================
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub graceful-gut-ai-${StageName}-web-acl
+      Scope: REGIONAL
+      Description: >-
+        Abuse controls for the Graceful Gut AI public API. Count-first rollout.
+      DefaultAction:
+        Allow: {}
+      # Body inspection limit, stated for API Gateway specifically. The API
+      # Gateway default is 16 KB and it is configurable to 64 KB; the commonly
+      # quoted 8 KB figure applies to Application Load Balancer and AppSync,
+      # not here. 16 KB is set explicitly so the value is reviewed rather than
+      # inherited, and the 4,096-byte cap below sits well inside it.
+      AssociationConfig:
+        RequestBody:
+          API_GATEWAY:
+            DefaultSizeInspectionLimit: KB_16
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub gracefulgut${StageName}webacl
+        # Sampled requests are what make a count-first rollout observable: with
+        # sampling off there is nothing to review before promoting a rule to
+        # Block. AWS retains the sample -- which includes client IP and request
+        # fragments -- for roughly three hours and it cannot be redacted. That
+        # is a deliberate, bounded exception to the IP-free logging posture,
+        # and it is why no WAF LoggingConfiguration exists in this stack: WAF
+        # logs cannot omit client IP at all, and enabling them would mean
+        # accepting IP retention as a standing default.
+        SampledRequestsEnabled: true
+      Rules:
+        # -- Body size. Not a managed rule; cannot false-positive on prose. --
+        - Name: BlockOversizedBodies
+          Priority: 10
+          Action:
+            Block: {}
+          Statement:
+            SizeConstraintStatement:
+              FieldToMatch:
+                Body:
+                  # MATCH, not CONTINUE. A body larger than the 16 KB
+                  # inspection limit cannot be measured, so treating oversize
+                  # as a match is what makes this rule total: bodies up to
+                  # 4,096 bytes pass, 4,097 bytes to 16 KB are measured and
+                  # blocked, and anything beyond 16 KB is blocked unmeasured.
+                  # CONTINUE would leave the largest bodies -- the ones this
+                  # rule exists for -- unblocked.
+                  OversizeHandling: MATCH
+              ComparisonOperator: GT
+              Size: 4096
+              TextTransformations:
+                - Priority: 0
+                  Type: NONE
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub gracefulgut${StageName}oversizedbody
+            SampledRequestsEnabled: true
+
+        # -- Method allow-list. GET, POST, OPTIONS and nothing else. --------
+        - Name: BlockUnsupportedMethods
+          Priority: 20
+          Action:
+            Block: {}
+          Statement:
+            NotStatement:
+              Statement:
+                OrStatement:
+                  Statements:
+                    - ByteMatchStatement:
+                        FieldToMatch:
+                          Method: {}
+                        PositionalConstraint: EXACTLY
+                        SearchString: GET
+                        TextTransformations:
+                          - Priority: 0
+                            Type: UPPERCASE
+                    - ByteMatchStatement:
+                        FieldToMatch:
+                          Method: {}
+                        PositionalConstraint: EXACTLY
+                        SearchString: POST
+                        TextTransformations:
+                          - Priority: 0
+                            Type: UPPERCASE
+                    - ByteMatchStatement:
+                        FieldToMatch:
+                          Method: {}
+                        PositionalConstraint: EXACTLY
+                        SearchString: OPTIONS
+                        TextTransformations:
+                          - Priority: 0
+                            Type: UPPERCASE
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub gracefulgut${StageName}unsupportedmethod
+            SampledRequestsEnabled: true
+
+        # -- Rate limits. Count until deliberately promoted. -----------------
+        - Name: RateLimitPerIpOverall
+          Priority: 30
+          Action: !If
+            - RateRulesBlock
+            - Block: {}
+            - Count: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref WafOverallRateLimit
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub gracefulgut${StageName}rateoverall
+            SampledRequestsEnabled: true
+
+        - Name: RateLimitPerIpEducationRoute
+          Priority: 40
+          Action: !If
+            - RateRulesBlock
+            - Block: {}
+            - Count: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref WafEducationRouteRateLimit
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+              # The URI path carries the stage prefix on the default endpoint,
+              # so the route is matched by suffix rather than exact value.
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  FieldToMatch:
+                    UriPath: {}
+                  PositionalConstraint: ENDS_WITH
+                  SearchString: /v1/education/ask
+                  TextTransformations:
+                    - Priority: 0
+                      Type: LOWERCASE
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub gracefulgut${StageName}rateeducation
+            SampledRequestsEnabled: true
+
+        # -- Managed rule groups. Every one starts in Count. -----------------
+        - Name: AmazonIpReputationList
+          Priority: 50
+          OverrideAction:
+            Count: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub gracefulgut${StageName}ipreputation
+            SampledRequestsEnabled: true
+
+        - Name: KnownBadInputs
+          Priority: 60
+          OverrideAction:
+            Count: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub gracefulgut${StageName}knownbadinputs
+            SampledRequestsEnabled: true
+
+        - Name: CommonRuleSet
+          Priority: 70
+          OverrideAction:
+            Count: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub gracefulgut${StageName}commonruleset
+            SampledRequestsEnabled: true
+
+        - Name: SqlDatabaseRuleSet
+          Priority: 80
+          OverrideAction:
+            Count: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub gracefulgut${StageName}sqli
+            SampledRequestsEnabled: true
+
+        # Count only, and not a candidate for promotion. Blocking VPN, proxy,
+        # and Tor traffic on a gut-health service punishes exactly the users
+        # most likely to want privacy while researching an embarrassing
+        # symptom. Promoting this rule needs an explicit owner decision, not a
+        # rollout step.
+        - Name: AnonymousIpList
+          Priority: 90
+          OverrideAction:
+            Count: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAnonymousIpList
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub gracefulgut${StageName}anonymousip
+            SampledRequestsEnabled: true
+
+      # Deliberately absent from the rule list:
+      #   - GeoMatchStatement. CLAUDE.md states educational content is not
+      #     geographically limited; only clinical services are. Geo-blocking
+      #     the educational endpoint would contradict a product boundary.
+      #   - Captcha and Challenge actions. An interactive puzzle in front of
+      #     someone seeking urgent guidance is a harm, and neither is needed
+      #     before abuse is actually observed.
+      Tags:
+        - { Key: Project, Value: GracefulGutAI }
+        - { Key: Environment, Value: Development }
+        - { Key: Owner, Value: AJMoses }
+        - { Key: Business, Value: GracefulHealth }
+
+  # There is no AWS::WAFv2::LoggingConfiguration here, and that is a decision
+  # rather than an omission. WAF logs always carry the client IP and cannot be
+  # configured to drop it, so enabling them would mean retaining IP addresses
+  # by default -- which collides with the no-identifying-information boundary.
+  # Rate-based rules work either way; WAF matches on IP internally whether or
+  # not anything is written down.
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      # Association is with the STAGE. A Web ACL that exists but is associated
+      # with nothing inspects nothing.
+      ResourceArn: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${RestApi}/stages/${StageName}
+      WebACLArn: !GetAtt WebAcl.Arn
+
+Outputs:
+  RestApiId:
+    Description: REST API ID. Needed to substitute <API_ID> in the reference policies.
+    Value: !Ref RestApi
+    Export:
+      Name: !Sub ${AWS::StackName}-RestApiId
+
+  StageName:
+    Description: The explicit stage name.
+    Value: !Ref StageName
+    Export:
+      Name: !Sub ${AWS::StackName}-StageName
+
+  InvokeUrl:
+    Description: Stage invoke URL. Not announced or linked until the migration says so.
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}
+    Export:
+      Name: !Sub ${AWS::StackName}-InvokeUrl
+
+  WebAclArn:
+    Description: ARN of the Web ACL associated with the stage.
+    Value: !GetAtt WebAcl.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-WebAclArn
+
+  AccessLogGroupName:
+    Description: Access log group. IP-free by format.
+    Value: !Ref AccessLogGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-AccessLogGroupName
+
+  AllowedOrigins:
+    Description: >-
+      The CORS origins the application must allow, comma-separated. Exported by
+      the infrastructure stack and imported by the application path -- never
+      the reverse, so the application cannot redefine what protects it.
+    Value: !If
+      - HasDevelopmentOrigin
+      - !Sub ${ProductionOrigin},${DevelopmentOrigin}
+      - !Ref ProductionOrigin
+    Export:
+      Name: !Sub ${AWS::StackName}-AllowedOrigins
+
+  EducationRouteEnabled:
+    Description: Whether POST /v1/education/ask exists in this stack.
+    Value: !Ref EnableEducationRoute
+    Export:
+      Name: !Sub ${AWS::StackName}-EducationRouteEnabled
