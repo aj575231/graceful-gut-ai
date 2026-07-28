@@ -1,0 +1,44 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ManageTheWebAclAndItsRules",
+      "Effect": "Allow",
+      "Action": [
+        "wafv2:CreateWebACL",
+        "wafv2:UpdateWebACL",
+        "wafv2:DeleteWebACL",
+        "wafv2:GetWebACL",
+        "wafv2:ListWebACLs",
+        "wafv2:TagResource",
+        "wafv2:UntagResource",
+        "wafv2:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:wafv2:us-east-2:<AWS_ACCOUNT_ID>:regional/webacl/<WEB_ACL_NAME>/<WEB_ACL_ID>"
+    },
+    {
+      "Sid": "AssociateTheWebAclWithTheApiStage",
+      "Effect": "Allow",
+      "Action": [
+        "wafv2:AssociateWebACL",
+        "wafv2:DisassociateWebACL",
+        "wafv2:GetWebACLForResource"
+      ],
+      "Resource": [
+        "arn:aws:wafv2:us-east-2:<AWS_ACCOUNT_ID>:regional/webacl/<WEB_ACL_NAME>/<WEB_ACL_ID>",
+        "arn:aws:apigateway:us-east-2::/restapis/<API_ID>/stages/*"
+      ]
+    },
+    {
+      "Sid": "ReadManagedRuleGroupsAndSampledTraffic",
+      "Effect": "Allow",
+      "Action": [
+        "wafv2:ListAvailableManagedRuleGroups",
+        "wafv2:DescribeManagedRuleGroup",
+        "wafv2:GetSampledRequests",
+        "wafv2:GetRateBasedStatementManagedKeys"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

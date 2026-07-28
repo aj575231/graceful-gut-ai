@@ -1,0 +1,39 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListLogGroupsCannotBeResourceScoped",
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadAndConfigureTheApplicationAndApiLogGroups",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DescribeLogStreams",
+        "logs:FilterLogEvents",
+        "logs:GetLogEvents",
+        "logs:PutRetentionPolicy",
+        "logs:TagLogGroup",
+        "logs:TagResource",
+        "logs:ListTagsForResource"
+      ],
+      "Resource": [
+        "arn:aws:logs:us-east-2:<AWS_ACCOUNT_ID>:log-group:/aws/lambda/graceful-gut-ai-dev-api:*",
+        "arn:aws:logs:us-east-2:<AWS_ACCOUNT_ID>:log-group:/aws/apigateway/graceful-gut-ai-dev:*"
+      ]
+    },
+    {
+      "Sid": "NoWriteAccessToLogContent",
+      "Effect": "Deny",
+      "Action": [
+        "logs:PutLogEvents",
+        "logs:DeleteLogGroup",
+        "logs:DeleteLogStream",
+        "logs:DeleteRetentionPolicy"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
