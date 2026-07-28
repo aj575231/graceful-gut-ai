@@ -15,15 +15,16 @@
       * It uses `git pull --ff-only`. A fast-forward can add commits but can
         never rewrite or discard them, so a divergent branch fails loudly
         instead of being silently merged or rebased.
-      * It never deletes, resets, checks out over, or force-updates anything.
+      * It never deletes, resets, checks out over, force-updates, or stashes
+        anything.
 
     It exists so that retrieving a report is one command rather than a sequence
     of PowerShell blocks pasted into a console by hand.
 
 .PARAMETER Branch
-    Required. The task branch, e.g. phase1e-api-gateway-design. If a local
-    branch of that name exists it is used; otherwise a tracking branch is
-    created from origin.
+    Required. The task branch, e.g. phase1e-api-gateway-design. If it is
+    already checked out, no switch is performed. If a local branch of that name
+    exists it is used; otherwise a tracking branch is created from origin.
 
 .PARAMETER ReportPath
     Optional. Repo-relative path to the report. When omitted, the most recently
@@ -43,6 +44,9 @@
 .NOTES
     Contains no credentials, secrets, account identifiers, or URLs. It needs
     only the Git remote the repository is already configured with.
+
+    Compatible with Windows PowerShell 5.1 and PowerShell 7. See Invoke-Git for
+    why native Git output needs care in both.
 #>
 
 [CmdletBinding()]
@@ -59,29 +63,114 @@ param(
 )
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+
+# $ErrorActionPreference is deliberately NOT set to 'Stop' at script scope.
+# Doing so is what broke this helper on Windows PowerShell 5.1 -- see Invoke-Git
+# below. Failures are detected explicitly, from exit codes.
 
 function Stop-WithMessage {
     param([string]$Message)
-    Write-Error $Message
+
+    # Written straight to the error stream rather than through Write-Error,
+    # which under a 'Stop' preference raises a terminating error and buries the
+    # message in an exception trace instead of exiting cleanly.
+    [Console]::Error.WriteLine($Message)
     exit 1
 }
 
 function Invoke-Git {
-    param([string[]]$Arguments, [string]$FailureMessage)
+    <#
+    .SYNOPSIS
+        Run Git and judge it by its exit code alone.
 
-    $output = & git @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Stop-WithMessage "$FailureMessage`n$output"
+    .DESCRIPTION
+        Git writes a great deal of ordinary, successful output to stderr:
+        "Switched to branch 'x'", fetch and pull progress, "Already up to
+        date." on some paths. None of it indicates failure.
+
+        Windows PowerShell 5.1 converts a native command's stderr into
+        ErrorRecord objects when 2>&1 is used. With $ErrorActionPreference set
+        to 'Stop', the first such record becomes a terminating
+        NativeCommandError -- so a Git command that exited 0 kills the script
+        purely for having printed a status line. PowerShell 7.3+ adds
+        $PSNativeCommandUseErrorActionPreference, which can turn a nonzero exit
+        into a terminating error too.
+
+        Both preferences are therefore set to a permissive value for the
+        duration of the call and restored in a finally block, so this function
+        cannot leak its own settings into the caller's session even if Git
+        throws. The exit code is the single source of truth.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    $previousErrorAction = $ErrorActionPreference
+
+    $nativePreference = Get-Variable -Name 'PSNativeCommandUseErrorActionPreference' `
+        -Scope Global -ErrorAction SilentlyContinue
+    $hasNativePreference = $null -ne $nativePreference
+    if ($hasNativePreference) {
+        $previousNativePreference = $nativePreference.Value
     }
-    return $output
+
+    try {
+        # 'Continue' makes a stderr line data rather than a terminating error.
+        $ErrorActionPreference = 'Continue'
+        if ($hasNativePreference) {
+            Set-Variable -Name 'PSNativeCommandUseErrorActionPreference' `
+                -Scope Global -Value $false
+        }
+
+        $captured = & git @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+        if ($hasNativePreference) {
+            Set-Variable -Name 'PSNativeCommandUseErrorActionPreference' `
+                -Scope Global -Value $previousNativePreference
+        }
+    }
+
+    # Merged stderr arrives as ErrorRecord objects; flatten to plain text so
+    # diagnostics read as Git wrote them.
+    $lines = @()
+    foreach ($item in $captured) {
+        if ($null -ne $item) { $lines += $item.ToString() }
+    }
+
+    return [pscustomobject]@{
+        ExitCode  = $exitCode
+        Output    = ($lines -join [Environment]::NewLine)
+        Succeeded = ($exitCode -eq 0)
+    }
+}
+
+function Invoke-GitOrStop {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$FailureMessage
+    )
+
+    $result = Invoke-Git -Arguments $Arguments
+    if (-not $result.Succeeded) {
+        Stop-WithMessage @"
+$FailureMessage
+
+git exit code: $($result.ExitCode)
+$($result.Output)
+"@
+    }
+    return $result
 }
 
 # --- Locate the repository ------------------------------------------------
-# Resolve from the script's own location so the command works from any
+# Resolved from the script's own location so the command works from any
 # directory, not only the repository root.
 
-$repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not (Test-Path (Join-Path $repoRoot '.git'))) {
     Stop-WithMessage "Not a Git repository: $repoRoot"
 }
@@ -89,15 +178,14 @@ Set-Location $repoRoot
 
 # --- Refuse to touch a dirty working tree ---------------------------------
 # Checked before anything else. Nothing below is worth risking uncommitted
-# work for.
+# work for. Never stashed, never discarded -- the user is told, and stops.
 
-$status = & git status --porcelain
-if ($LASTEXITCODE -ne 0) {
-    Stop-WithMessage 'Could not read Git status.'
-}
-if (-not [string]::IsNullOrWhiteSpace(($status | Out-String).Trim())) {
+$status = Invoke-GitOrStop -Arguments @('status', '--porcelain') `
+    -FailureMessage 'Could not read Git status.'
+
+if (-not [string]::IsNullOrWhiteSpace($status.Output)) {
     Write-Host 'Working tree is not clean:' -ForegroundColor Yellow
-    $status | ForEach-Object { Write-Host "  $_" }
+    $status.Output -split "`n" | ForEach-Object { Write-Host "  $_" }
     Stop-WithMessage @'
 Commit or stash your changes before running this script.
 Nothing was changed. No branch was switched and no file was modified.
@@ -105,35 +193,46 @@ Nothing was changed. No branch was switched and no file was modified.
 }
 
 # --- Fetch -----------------------------------------------------------------
+# Writes progress to stderr on every run. Judged by exit code only.
 
-Write-Host "Fetching origin..." -ForegroundColor Cyan
-Invoke-Git -Arguments @('fetch', 'origin') -FailureMessage 'git fetch origin failed.'
+Write-Host 'Fetching origin...' -ForegroundColor Cyan
+Invoke-GitOrStop -Arguments @('fetch', 'origin') `
+    -FailureMessage 'git fetch origin failed.' | Out-Null
 
-# --- Switch to the branch --------------------------------------------------
-# Existing local branch, or a new tracking branch from origin. Never a force
-# checkout.
+# --- Switch to the branch, if not already on it ----------------------------
 
-$localExists = $false
-& git show-ref --verify --quiet "refs/heads/$Branch"
-if ($LASTEXITCODE -eq 0) { $localExists = $true }
+$current = Invoke-GitOrStop -Arguments @('rev-parse', '--abbrev-ref', 'HEAD') `
+    -FailureMessage 'Could not determine the current branch.'
+$currentBranch = $current.Output.Trim()
 
-if ($localExists) {
-    Write-Host "Switching to local branch '$Branch'..." -ForegroundColor Cyan
-    Invoke-Git -Arguments @('switch', $Branch) `
-        -FailureMessage "Could not switch to '$Branch'."
+if ($currentBranch -eq $Branch) {
+    Write-Host "Already on '$Branch'; no switch needed." -ForegroundColor DarkGray
 }
 else {
-    & git show-ref --verify --quiet "refs/remotes/origin/$Branch"
-    if ($LASTEXITCODE -ne 0) {
-        Stop-WithMessage @"
+    $localRef = Invoke-Git -Arguments @(
+        'show-ref', '--verify', '--quiet', "refs/heads/$Branch")
+
+    if ($localRef.Succeeded) {
+        Write-Host "Switching to local branch '$Branch'..." -ForegroundColor Cyan
+        Invoke-GitOrStop -Arguments @('switch', $Branch) `
+            -FailureMessage "Could not switch to '$Branch'." | Out-Null
+    }
+    else {
+        $remoteRef = Invoke-Git -Arguments @(
+            'show-ref', '--verify', '--quiet', "refs/remotes/origin/$Branch")
+
+        if (-not $remoteRef.Succeeded) {
+            Stop-WithMessage @"
 Branch '$Branch' does not exist locally or on origin.
-Check the name, or run 'git fetch origin' if it was pushed just now.
+Check the name, or re-run if it was pushed just now.
 Nothing was changed.
 "@
+        }
+
+        Write-Host "Creating tracking branch '$Branch' from origin..." -ForegroundColor Cyan
+        Invoke-GitOrStop -Arguments @('switch', '--track', "origin/$Branch") `
+            -FailureMessage "Could not create a tracking branch for '$Branch'." | Out-Null
     }
-    Write-Host "Creating tracking branch '$Branch' from origin..." -ForegroundColor Cyan
-    Invoke-Git -Arguments @('switch', '--track', "origin/$Branch") `
-        -FailureMessage "Could not create a tracking branch for '$Branch'."
 }
 
 # --- Fast-forward only -----------------------------------------------------
@@ -141,11 +240,12 @@ Nothing was changed.
 # divergent branch stops here rather than being merged or rebased silently.
 
 Write-Host 'Pulling (fast-forward only)...' -ForegroundColor Cyan
-$pull = & git pull --ff-only 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Host ($pull | Out-String) -ForegroundColor Yellow
+$pull = Invoke-Git -Arguments @('pull', '--ff-only')
+if (-not $pull.Succeeded) {
+    Write-Host $pull.Output -ForegroundColor Yellow
     Stop-WithMessage @"
-git pull --ff-only failed. The local branch has diverged from origin.
+git pull --ff-only failed (exit code $($pull.ExitCode)).
+The local branch has most likely diverged from origin.
 
 Nothing was changed and no commit was lost. Resolve it yourself, so the
 decision about which history to keep stays with you:

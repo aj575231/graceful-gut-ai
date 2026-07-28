@@ -203,14 +203,13 @@ def test_helper_pulls_fast_forward_only() -> None:
     """A fast-forward can add commits but never rewrite or discard them."""
     text = HELPER.read_text(encoding="utf-8")
 
-    assert "--ff-only" in text
-    assert "git pull" in text
+    assert "'pull', '--ff-only'" in text, "the pull invocation must be --ff-only"
 
 
 def test_helper_checks_for_a_dirty_working_tree() -> None:
     text = HELPER.read_text(encoding="utf-8")
 
-    assert "git status --porcelain" in text
+    assert "'status', '--porcelain'" in text
     assert "Working tree is not clean" in text
 
 
@@ -251,3 +250,122 @@ def test_helper_usage_is_documented_in_claude_md() -> None:
     assert "pull-task-report.ps1" in text
     assert "-Branch" in text
     assert "-NoOpen" in text
+
+
+# ---------------------------------------------------------------------------
+# Windows PowerShell native-command compatibility.
+#
+# Git writes ordinary successful output to stderr -- "Switched to branch 'x'",
+# fetch and pull progress. Windows PowerShell 5.1 turns a native command's
+# stderr into ErrorRecord objects when 2>&1 is used, and under a 'Stop'
+# preference the first one becomes a terminating NativeCommandError. The helper
+# therefore died on Git commands that had exited 0.
+#
+# These tests pin the fix: exit code is the only success signal, the
+# preferences the wrapper changes are restored in a finally block, and neither
+# the dirty-tree check nor the fast-forward-only pull is weakened.
+# ---------------------------------------------------------------------------
+
+
+def helper_source() -> str:
+    return HELPER.read_text(encoding="utf-8")
+
+
+def test_git_is_judged_by_exit_code_not_stderr() -> None:
+    text = helper_source()
+
+    assert "$LASTEXITCODE" in text
+    assert "Succeeded = ($exitCode -eq 0)" in text
+
+
+def test_error_action_preference_is_not_stop_at_script_scope() -> None:
+    """A 'Stop' preference at script scope is what caused the failure."""
+    text = helper_source()
+
+    assert not re.search(r"(?m)^\s*\$ErrorActionPreference\s*=\s*'Stop'", text), (
+        "a script-scope 'Stop' preference reintroduces the NativeCommandError bug"
+    )
+
+
+def test_native_command_preferences_are_made_permissive_for_the_call() -> None:
+    text = helper_source()
+
+    assert "$ErrorActionPreference = 'Continue'" in text
+    assert "PSNativeCommandUseErrorActionPreference" in text
+
+
+def test_changed_preferences_are_restored_in_a_finally_block() -> None:
+    """Otherwise the wrapper leaks its settings into the caller's session."""
+    text = helper_source()
+
+    finally_start = text.index("finally {")
+    finally_block = text[finally_start : finally_start + 400]
+
+    assert "$ErrorActionPreference = $previousErrorAction" in finally_block
+    assert "previousNativePreference" in finally_block
+
+
+def test_nonzero_exit_still_fails_with_diagnostics() -> None:
+    text = helper_source()
+
+    assert "if (-not $result.Succeeded)" in text
+    assert "git exit code:" in text
+    assert "Invoke-GitOrStop" in text
+
+
+def test_write_error_is_not_used_for_fatal_messages() -> None:
+    """Write-Error under a Stop preference buries the message in a trace.
+
+    Matched as an invocation: the helper's own comment explains why it is
+    avoided, so the bare word appears legitimately.
+    """
+    calls = [
+        line
+        for line in helper_source().splitlines()
+        if line.strip().startswith("Write-Error")
+    ]
+
+    assert calls == []
+    assert "[Console]::Error.WriteLine" in helper_source()
+
+
+def test_current_branch_detection_avoids_unnecessary_switching() -> None:
+    text = helper_source()
+
+    assert "rev-parse', '--abbrev-ref', 'HEAD'" in text
+    assert "if ($currentBranch -eq $Branch)" in text
+    assert "no switch needed" in text
+
+
+def test_dirty_tree_check_is_not_weakened() -> None:
+    """The check must still run, and must still stop the script."""
+    text = helper_source()
+
+    assert "'status', '--porcelain'" in text
+    assert "Working tree is not clean" in text
+    assert "IsNullOrWhiteSpace($status.Output)" in text
+
+
+def test_local_work_is_never_stashed_or_discarded() -> None:
+    text = helper_source()
+
+    assert not re.search(r"git\s+stash", text, re.IGNORECASE)
+    assert not re.search(r"git\s+(checkout|switch)\s+.*--force", text, re.IGNORECASE)
+
+
+def test_fast_forward_only_pull_is_retained() -> None:
+    text = helper_source()
+
+    assert "'pull', '--ff-only'" in text
+
+
+def test_documented_parameters_survive_the_fix() -> None:
+    """The correction must not change the helper's interface."""
+    text = helper_source()
+
+    assert "[string]$Branch" in text
+    assert "[string]$ReportPath" in text
+    assert "[switch]$NoOpen" in text
+    assert "Mandatory = $true" in text
+    assert "$PSBoundParameters.ContainsKey('ReportPath')" in text
+    assert "if ($NoOpen)" in text
