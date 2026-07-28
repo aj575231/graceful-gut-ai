@@ -449,6 +449,143 @@ not assume ECR is live.
 
 ---
 
+## Mandatory Task Completion Report Protocol
+
+Every Claude task in this repository produces a written report. This applies
+**unless the user explicitly overrides it** for a given task — silence is not an
+override, and neither is a task that seems too small to need one.
+
+The reason is specific to how this repository is worked on: the session that did
+the work is not the durable record. A terminal transcript is lost, scrolled past,
+or read by someone who was not there. The report is what survives, and it is what
+an administrator, a clinician, or a future session actually reads.
+
+### A. A report is always written
+
+A complete Markdown report is written whether the task:
+
+- **succeeds**
+- **partially succeeds**
+- **is blocked**
+- **fails verification**
+- **makes no code changes at all**
+
+A blocked or failed task is *more* worth reporting than a successful one, not
+less. "Nothing to report" is not a valid outcome — if no code changed, the report
+records what was investigated and why nothing changed.
+
+### B. Report location
+
+- Use the report path **explicitly supplied by the task**, when one is given.
+- When no path is supplied, use `docs/audits/<task-slug>-YYYY-MM-DD.md`.
+- The task slug is short, lowercase, and hyphenated — `phase1d-live-deployment`,
+  `iam-policy-syntax-hotfix`.
+- **Update an existing task report rather than creating a duplicate.** A second
+  report for the same task fragments the record. If a task is revisited, extend
+  its report and say what changed.
+
+### C. Required contents
+
+Every report includes each of the following, omitting none:
+
+| Field | Notes |
+| --- | --- |
+| Task title and date | |
+| **Outcome** | Exactly one of `SUCCESS`, `PARTIAL`, `BLOCKED`, `FAILED` |
+| Branch name | |
+| Task objective | What was asked, in one or two sentences |
+| Starting commit | Where the branch began |
+| Implementation commits | Every commit that changed code, tests, or configuration |
+| Report commit | |
+| Files added, modified, or deleted | |
+| Description of work completed | Concise |
+| Tests and exact results | Counts, not "tests pass" |
+| Lint and formatting results | |
+| Deployment status | Including "not deployed" |
+| **AWS resources created, read, modified, or deleted** | Including "none" |
+| Security and privacy checks | |
+| Blockers or unresolved findings | |
+| Decisions required from AJ or Jenna | |
+| Recommended next step | |
+| Whether the branch was pushed | |
+
+### D. Reports are redacted by construction
+
+Redaction is not a review step applied at the end. The report is written so the
+material was never in it. Never include:
+
+- credentials, passwords, tokens, API keys
+- secret **values** of any kind
+- secret **identifiers**, unless explicitly approved for that report
+- account IDs, instance IDs, full ARNs
+- private URLs, including the live Function URL
+- authorization headers
+- user health text, PHI, or personal identifying information
+
+Git commit SHAs, `CodeSha256` values, and build hashes are **not** secrets and
+belong in the report — they are how a deployment is tied back to source.
+
+### E. Commit behaviour
+
+- **Commit implementation work separately from the report.** One commit that
+  changes behaviour and also documents it cannot be reviewed or reverted cleanly.
+- **Commit the report as the final commit** when practical.
+- A **blocked or failed** task still produces a report-only commit, unless the
+  task explicitly prohibits commits.
+- **Never mix unrelated changes** into either commit.
+- **Push the task branch after verification**, unless explicitly prohibited.
+- **Never merge to `main`** unless explicitly instructed.
+
+### F. Final terminal response
+
+**Do not paste the full report into the terminal** unless the user explicitly
+asks for it. The report is a file; duplicating it in the transcript buries the
+part the user needs to act on.
+
+The final response is **at most 10 short lines**, drawn from:
+
+```
+Outcome:
+Branch:
+Report:
+Implementation commit:
+Report commit:
+Tests:
+Push:
+AWS modified:
+Blocker:
+Next action:
+```
+
+Omit lines that do not apply. Do not add narration around them.
+
+### G. When the push fails
+
+- **Keep the report saved locally** — never discard it because it could not be
+  pushed.
+- State the **exact local report path**.
+- State the **precise push blocker**, not "push failed".
+- **Do not print the entire report** in the terminal as a substitute.
+
+### Retrieving a report on Windows
+
+`scripts/pull-task-report.ps1` fetches a task branch and opens its report:
+
+```powershell
+.\scripts\pull-task-report.ps1 -Branch phase1e-api-gateway-design
+
+.\scripts\pull-task-report.ps1 `
+  -Branch phase1e-api-gateway-design `
+  -ReportPath docs/audits/phase1e-api-gateway-design-2026-07-28.md
+```
+
+It refuses to run against a dirty working tree, uses `git pull --ff-only` so it
+can never rewrite local commits, and selects the newest report under
+`docs/audits/` when `-ReportPath` is omitted. `-NoOpen` prints the path without
+opening an editor.
+
+---
+
 ## Project phases
 
 - **Phase 1 (current)** — foundation: health/version endpoints, reproducible
