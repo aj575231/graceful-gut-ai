@@ -4,8 +4,11 @@
 **Outcome:** `SUCCESS`
 **Branch:** `chore/claude-report-workflow`
 **Starting commit:** `302d97c` (`main`, fast-forwarded from origin before branching)
-**Implementation commit:** `f4606ffe5a1f75df881eb45375d0055ff77cce71` — *Standardize Claude task reporting workflow*
-**Report commit:** the commit adding this file — *Document reporting workflow*
+**Implementation commits:**
+- `f4606ffe5a1f75df881eb45375d0055ff77cce71` — *Standardize Claude task reporting workflow*
+- `9f59676a6a721726f42261f943e88a387272ad76` — *Fix PowerShell Git stderr handling*
+
+**Report commits:** `85b0ee3` — *Document reporting workflow*; and the commit adding the correction section below — *Document report helper compatibility fix*
 
 This report is redacted by construction: no credential, password, token, API
 key, secret value, secret identifier, account ID, instance ID, full ARN, private
@@ -24,9 +27,13 @@ reports, and static tests locking both in. Repository workflow only.
 
 ## Outcome
 
-`SUCCESS`. The protocol is written, the helper exists, nineteen tests enforce
-both, and all gates pass. One limitation is recorded under **Blockers** below:
-the PowerShell helper could not be *executed* on this host.
+`SUCCESS`. The protocol is written, the helper exists, thirty tests enforce
+both, and all gates pass.
+
+The helper was subsequently found to have a **Windows PowerShell failure** and
+was corrected — see *Correction: PowerShell Git stderr handling* below. The
+limitation recorded under **Blockers** stands: the helper still cannot be
+*executed* on this Linux host.
 
 ---
 
@@ -42,8 +49,8 @@ the PowerShell helper could not be *executed* on this host.
 
 | File | Purpose |
 | --- | --- |
-| `scripts/pull-task-report.ps1` | Windows helper — fetch a task branch and open its report |
-| `backend/tests/test_reporting_workflow.py` | 19 static guards over the protocol and the helper |
+| `scripts/pull-task-report.ps1` | Windows helper — fetch a task branch and open its report. Corrected for Windows PowerShell; see below |
+| `backend/tests/test_reporting_workflow.py` | 30 static guards — 19 over the protocol and helper, 11 over the PowerShell correction |
 | `docs/audits/claude-reporting-workflow-2026-07-28.md` | This report |
 
 ### Deleted
@@ -121,8 +128,10 @@ the Git remote the repository is already configured with.
 
 ## Tests and exact results
 
-Nineteen tests in `backend/tests/test_reporting_workflow.py`, taking the suite
-from 92 to **111** on this branch.
+Nineteen tests were added with the original helper, taking the suite from 92 to
+**111**. The PowerShell correction added eleven more, for **30** tests in
+`backend/tests/test_reporting_workflow.py` and **122** in the suite. The
+correction's tests are listed in its own section below.
 
 | Requirement | Tests |
 | --- | --- |
@@ -187,6 +196,97 @@ The only commands run were local: `git`, `pytest`, `ruff`, and file writes.
 | Protocol forbids secrets in reports | **PASS** — full redaction list asserted |
 | Application behaviour unchanged | **PASS** — `backend/app/` untouched |
 | This report redacted | **PASS** — scanned before commit |
+
+---
+
+## Correction: PowerShell Git stderr handling
+
+**Correction commit:** `9f59676a6a721726f42261f943e88a387272ad76` — *Fix PowerShell Git stderr handling*
+
+### The failure
+
+The helper stopped on Git commands that had **succeeded**. It invoked Git as:
+
+```powershell
+$output = & git @Arguments 2>&1
+```
+
+under a script-scope `$ErrorActionPreference = 'Stop'`.
+
+Windows PowerShell 5.1 converts a native command's stderr into `ErrorRecord`
+objects when `2>&1` is used. Under a `Stop` preference the first such record
+becomes a terminating `NativeCommandError`. Git writes a great deal of ordinary
+successful output to stderr — `Switched to branch 'chore/claude-report-workflow'`
+is written there, as is fetch and pull progress — so the helper died on a
+command Git had exited `0` from.
+
+This was not limited to `git switch`. `fetch` and `pull` write progress to
+stderr on every run, so the wrapper itself had to be fixed regardless.
+
+### The correction
+
+| Change | Effect |
+| --- | --- |
+| Exit code is the only success signal | `$LASTEXITCODE`, never the presence of stderr text |
+| `$ErrorActionPreference = 'Continue'` for the duration of the call | A stderr line is data, not a terminating error |
+| `$PSNativeCommandUseErrorActionPreference = $false` where it exists | PowerShell 7.3+ does not turn a nonzero exit into a terminating error from the other direction |
+| Both restored in a **`finally`** block | The wrapper cannot leak its own settings into the caller's session, even if Git throws |
+| Merged stderr flattened to plain text | Diagnostics read as Git wrote them |
+| `Invoke-GitOrStop` reports the message **and** the exit code | A genuine failure still fails clearly |
+| Fatal messages written to `[Console]::Error` | `Write-Error` under a `Stop` preference raises a terminating error and buries the message in an exception trace instead of exiting cleanly |
+| Current branch detected with `rev-parse` | An unnecessary `git switch` is skipped when the branch is already checked out |
+
+The last item is worth having but is **not** the fix. The wrapper was the fault.
+
+### What was deliberately not changed
+
+- The **dirty-working-tree check** still runs first and still stops the script.
+- The pull is still **`--ff-only`**.
+- Nothing is deleted, reset, force-updated, or **stashed**.
+- The `-Branch`, `-ReportPath`, and `-NoOpen` interface is unchanged.
+
+### Tests added
+
+Eleven, taking the suite from 111 to **122**:
+
+| Test | Asserts |
+| --- | --- |
+| `test_git_is_judged_by_exit_code_not_stderr` | Success is read from `$LASTEXITCODE` |
+| `test_error_action_preference_is_not_stop_at_script_scope` | The original cause cannot return |
+| `test_native_command_preferences_are_made_permissive_for_the_call` | Both preferences are handled |
+| `test_changed_preferences_are_restored_in_a_finally_block` | No preference leaks to the caller |
+| `test_nonzero_exit_still_fails_with_diagnostics` | A real failure still fails, with the exit code |
+| `test_write_error_is_not_used_for_fatal_messages` | Matched as an invocation, not a comment |
+| `test_current_branch_detection_avoids_unnecessary_switching` | `rev-parse` guard present |
+| `test_dirty_tree_check_is_not_weakened` | The guard still runs and still stops |
+| `test_local_work_is_never_stashed_or_discarded` | No `git stash`, no force checkout |
+| `test_fast_forward_only_pull_is_retained` | `--ff-only` retained |
+| `test_documented_parameters_survive_the_fix` | Interface unchanged |
+
+Three earlier assertions were matching Git invocations as bare strings
+(`"git status --porcelain"`, `"git pull"`) and one matched `Write-Error` as a
+bare word. The rewrite moved to array argument form, and the helper's comments
+legitimately mention `Write-Error` while explaining why it is avoided. All four
+now match commands rather than prose — the same false-positive class that
+appeared twice in the Phase 1E review.
+
+### Gate results after the correction
+
+| Gate | Result |
+| --- | --- |
+| `.venv/bin/python -m pytest -q` | **PASS** — 122 passed (11 new) |
+| `.venv/bin/ruff check backend/` | **PASS** |
+| `.venv/bin/ruff format --check backend/` | **PASS** — 13 files formatted |
+| `git diff --check` | **PASS** |
+| PowerShell structure | **PASS** — braces and parentheses balanced; no here-string terminator indented, which would be a parse error |
+
+### Still not executed
+
+No PowerShell interpreter exists on this Linux host, so the corrected script was
+verified statically and by thirty content assertions but **never run**. The
+recommended next step is unchanged and now more pointed: run it once on Windows,
+against both a clean and a deliberately dirty working tree, and confirm that a
+successful `git switch` no longer terminates it.
 
 ---
 
