@@ -213,8 +213,16 @@ echo "    GET /health            -> ${HEALTH_CODE}"
 UNAUTH_CODE="$(status_of "${FUNCTION_URL}/version")"
 echo "    GET /version (no key)  -> ${UNAUTH_CODE}"
 
+# Also unkeyed, and the expected answer is 401 rather than 404. The shared
+# secret gate runs BEFORE route resolution, so an anonymous caller gets the
+# same 401 whether or not the route exists -- that is what stops the surface
+# being enumerated by telling 401 from 404. The schema being hidden shows up
+# as a 404 only for an authenticated caller, which this script cannot and must
+# not test: it holds no key. test_security.py::test_gate_does_not_leak_which_
+# routes_exist pins the application behaviour; test_deploy_script.py pins the
+# expectation below so it cannot drift back to 404.
 OPENAPI_CODE="$(status_of "${FUNCTION_URL}/openapi.json")"
-echo "    GET /openapi.json      -> ${OPENAPI_CODE}"
+echo "    GET /openapi.json (no key) -> ${OPENAPI_CODE}"
 
 echo
 echo "==> Deployed"
@@ -223,8 +231,8 @@ echo "    Git commit: ${GIT_SHA}${GIT_DIRTY}"
 
 FAILED=0
 [[ "${HEALTH_CODE}" == "200" ]] || { echo "    FAIL: /health expected 200"; FAILED=1; }
-[[ "${OPENAPI_CODE}" == "404" ]] \
-  || { echo "    FAIL: /openapi.json expected 404"; FAILED=1; }
+[[ "${OPENAPI_CODE}" == "401" ]] \
+  || { echo "    FAIL: /openapi.json without a key expected 401, got ${OPENAPI_CODE}"; FAILED=1; }
 
 case "${UNAUTH_CODE}" in
   401) ;;
