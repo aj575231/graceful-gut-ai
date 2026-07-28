@@ -278,11 +278,14 @@ def test_application_never_logs_a_request_or_response_body() -> None:
 def plain(text: str) -> str:
     """Normalise Markdown prose for phrase matching.
 
-    Emphasis markers are stripped and every whitespace run is collapsed to a
-    single space, because these documents are hard-wrapped -- a sentence the
-    reader sees as one phrase is split across a newline in the source.
+    Emphasis markers and blockquote markers are stripped and every whitespace
+    run is collapsed to a single space, because these documents are
+    hard-wrapped -- a sentence the reader sees as one phrase is split across a
+    newline in the source, and a wrapped blockquote puts a ``>`` in the middle
+    of it.
     """
-    return re.sub(r"\s+", " ", re.sub(r"[*_`]", "", text))
+    unquoted = re.sub(r"(?m)^\s*>\s?", "", text)
+    return re.sub(r"\s+", " ", re.sub(r"[*_`]", "", unquoted))
 
 
 def test_function_url_is_not_described_as_the_final_public_endpoint() -> None:
@@ -303,3 +306,155 @@ def test_architecture_docs_mentioning_the_function_url_plan_its_retirement() -> 
             f"{path.relative_to(REPO_ROOT)} describes the Function URL "
             "without planning its retirement"
         )
+
+
+# ---------------------------------------------------------------------------
+# Corrections locked in after the Phase 1E review.
+#
+# Each assertion below corresponds to a claim the first draft of the ADR got
+# wrong. They exist so a future edit cannot quietly reintroduce the error --
+# the wrong version of several of these would have produced a broken preflight,
+# an unenforced size cap, or a dangerous emergency-routing design.
+# ---------------------------------------------------------------------------
+
+
+def adr_text() -> str:
+    return plain(ADR.read_text(encoding="utf-8"))
+
+
+def section(heading: str) -> str:
+    """The ADR text under ``heading``, up to the next heading of any level."""
+    raw = ADR.read_text(encoding="utf-8")
+    start = raw.index(heading)
+    remainder = raw[start + len(heading) :]
+    end = remainder.find("\n## ")
+    nearer = remainder.find("\n### ")
+    if nearer != -1 and (end == -1 or nearer < end):
+        end = nearer
+    return plain(remainder if end == -1 else remainder[:end])
+
+
+def test_waf_body_inspection_limit_is_stated_for_api_gateway() -> None:
+    """16 KB default, 64 KB configurable. 8 KB is ALB and AppSync."""
+    adr = adr_text()
+
+    assert "is 16 KB, configurable up to 64 KB" in adr
+    assert "Application Load Balancer and AppSync, not to API Gateway" in adr
+    assert "first 8 KB of a request body" not in adr
+
+
+def test_body_size_cap_is_a_waf_rule_not_request_validation() -> None:
+    adr = adr_text()
+
+    assert "request validation cannot enforce a maximum body size" in adr
+    assert "SizeConstraintStatement" in adr
+    assert "4,096 bytes" in adr
+
+
+def test_application_checks_both_byte_size_and_character_length() -> None:
+    adr = adr_text()
+
+    assert "byte size" in adr and "character length" in adr
+
+
+def test_unsupported_content_types_are_rejected_explicitly() -> None:
+    adr = adr_text()
+
+    assert "application/json only" in adr
+    assert "415" in adr
+
+
+def test_request_model_validation_skip_is_documented() -> None:
+    """API Gateway skips validation when no model matches the content type."""
+    adr = adr_text()
+
+    assert "skips request-model validation" in adr
+    assert "$default" in adr
+    assert "NEVER" in adr
+    assert "Validate body" in adr
+
+
+def test_adr_does_not_claim_browsers_cannot_be_authenticated() -> None:
+    """The phrase may appear only where the ADR quotes it to refute it."""
+    adr = adr_text()
+
+    assert '"browsers cannot be authenticated" — they can be' in adr
+    assert adr.count("cannot be authenticated") == 1, (
+        "the claim that browsers cannot be authenticated appears outside the "
+        "one place it is quoted and corrected"
+    )
+    assert "cannot safely keep is a permanent shared client secret" in adr
+
+
+def test_future_accounts_have_a_named_authentication_path() -> None:
+    adr = adr_text()
+
+    assert "PKCE" in adr
+    assert "authorization-code flow" in adr
+
+
+def test_preflight_expectation_matches_starlette() -> None:
+    """Starlette's CORSMiddleware answers an allowed preflight with 200."""
+    adr = adr_text()
+
+    assert "returns 200, not 204" in adr
+
+
+def test_options_routing_caveat_is_documented() -> None:
+    adr = adr_text()
+
+    assert "{proxy+}" in adr or "proxy+" in adr
+    assert "ANY" in adr
+
+
+def test_emergency_routing_does_not_claim_a_bypass() -> None:
+    """As with the authentication claim, the old wording survives only as a
+    quotation that the ADR immediately corrects."""
+    adr = adr_text()
+
+    assert "cannot bypass WAF, throttling, or a challenge" in adr
+    assert adr.count("must not be gated behind a challenge") == 1
+    assert "That is not implementable" in adr
+
+
+def test_emergency_guidance_is_static_and_in_every_failure_path() -> None:
+    emergency = section("### Emergency routing must not depend on the API")
+
+    assert "permanently visible" in emergency
+    for failure in ("403", "429", "5xx", "Timeout"):
+        assert failure in emergency, f"{failure} fallback not covered"
+    assert "/health" in emergency
+
+
+def test_legal_review_is_launch_blocking_and_hipaa_is_not_settled() -> None:
+    adr = adr_text()
+
+    assert "launch-blocking" in adr
+    assert "FTC Health Breach Notification Rule" in adr
+    assert "This ADR does not state that the service is outside HIPAA" in adr
+    assert "outside HIPAA's scope" not in adr
+
+
+def test_model_provider_data_flow_decision_is_complete() -> None:
+    provider = section("### L2 — Model-provider data-flow determination")
+
+    for topic in (
+        "BAA availability",
+        "Retention",
+        "Training use",
+        "Zero-data-retention",
+        "Subprocessors",
+        "Region",
+        "Deletion",
+        "Breach handling",
+        "Maximum content transmitted",
+    ):
+        assert topic in provider, f"{topic} missing from the L2 decision"
+
+
+def test_infrastructure_and_application_stacks_are_separated() -> None:
+    adr = adr_text()
+
+    assert "Administrator only" in adr
+    assert "change set" in adr
+    assert "must not be able to modify WAF or IAM" in adr

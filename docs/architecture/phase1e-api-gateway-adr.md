@@ -56,14 +56,27 @@ this go wrong.
 | | Authentication | Abuse control |
 | --- | --- | --- |
 | Question answered | *Who is this caller?* | *Is this traffic acceptable?* |
-| Requires | a secret the caller can keep | nothing from the caller |
-| Possible in a public browser? | **No** | **Yes** |
-| Examples | API key, JWT, SigV4, session cookie | WAF, rate limits, size caps, concurrency ceiling, budgets |
+| Requires | a per-user credential obtained through a flow | nothing from the caller |
+| Needs a permanent shared client secret? | **No — and must not use one** | n/a |
+| Examples | OIDC authorization-code flow with PKCE, session cookie | WAF, rate limits, size caps, concurrency ceiling, budgets |
 | Failure mode | impersonation | cost and availability damage |
 
-A public browser client cannot keep a secret, so it cannot be authenticated.
-What it *can* be is constrained. Phase 1E therefore invests entirely in abuse
-controls and deliberately ships **no** authentication on the public route.
+The accurate constraint is narrower than "browsers cannot be authenticated" —
+they can be. **What a browser cannot safely keep is a permanent shared client
+secret**, because everything shipped to it is readable by every visitor. Public
+clients therefore authenticate through flows that issue short-lived per-user
+credentials and require no embedded secret.
+
+The anonymous public beta **intentionally has no authentication**: there are no
+accounts, so there is no user to authenticate, and abuse control is the whole
+of the defence. That is a deliberate product decision, not a technical
+limitation.
+
+If accounts are later adopted (§15), the supported path is **Amazon Cognito, or
+another OIDC provider, using the authorization-code flow with PKCE** — a public
+client with no client secret, issuing short-lived tokens validated by an API
+Gateway authorizer. Recording that now matters, because "we cannot authenticate
+a browser" would be the wrong reason to rule accounts out.
 
 `X-GG-Key` does not survive this transition. It is a single static shared
 secret with no per-caller identity, no revocation, and no rate limiting. It
@@ -162,9 +175,10 @@ Primary reasons:
    Size caps, length caps, and content-type enforcement at the edge are the
    single most effective denial-of-wallet control available, and Option B has
    none.
-3. **Honest security posture.** A public browser client cannot hold a secret,
-   so the design provides no authentication and says so, rather than shipping a
-   client-visible token and describing it as one.
+3. **Honest security posture.** A public browser client cannot safely hold a
+   permanent shared secret, so the design ships no such secret and provides no
+   authentication for an anonymous beta — rather than embedding a
+   client-visible token and describing it as security.
 4. **Cost difference is immaterial.** ~$2.50 per million requests separates the
    options. Model spend dominates the bill by orders of magnitude, and §12's
    controls target that.
@@ -176,13 +190,19 @@ Primary reasons:
 Accounts would require collecting an email address, which is identifying
 information. Account-linked conversation history is precisely the
 account-linked symptom history that `CLAUDE.md` prohibits in V1, and it would
-turn a system explicitly designed to be outside HIPAA's scope into one holding
-a health-data path. Accounts also add password reset, session management,
-credential storage, and breach exposure — a large surface added to *reduce*
-abuse, when abuse is better handled by controls that need no identity at all.
+create an identified health-data path where the design currently has none —
+which changes the regulatory analysis that §15 defers to qualified review.
+Accounts also add password reset, session management, credential storage, and
+breach exposure — a large surface added to *reduce* abuse, when abuse is better
+handled by controls that need no identity at all.
 
 Accounts would also not solve the problem they appear to solve: anyone can
 create one, so an account is a speed bump for automated abuse, not a barrier.
+
+This is a recommendation about **product scope and data collection**, not a
+technical verdict. Authenticating a browser is entirely possible (see above);
+the argument against accounts is that the beta does not need them and they
+enlarge the data footprint.
 
 ### How anonymous requests are protected
 
@@ -251,11 +271,14 @@ gut-health phrasings, record which rule IDs fire, and exclude those specific
 rule IDs — never disable a whole rule group. Application-side input handling,
 not WAF, is the correct defence against prompt manipulation (§13).
 
-**WAF body inspection limit:** for regional resources WAF inspects roughly the
-first 8 KB of a request body by default. Our maximum body (§3) is well under
-that, so no oversize-handling configuration is required — but the caps must be
-enforced by request validation regardless, because WAF's limit is not a size
-control.
+**WAF body inspection limit:** for **API Gateway** the default inspection limit
+is **16 KB**, configurable up to **64 KB**. The commonly quoted 8 KB figure
+applies to **Application Load Balancer and AppSync**, not to API Gateway.
+
+Our 4 KB body cap (§3) sits well inside the default, so every request is
+inspected in full and no oversize-handling configuration is required. The
+inspection limit is nonetheless **not** a size control — it governs how much
+WAF *reads*, not what it *allows*. Capping body size is a separate rule (§3).
 
 ### Anonymous IP list — deliberately count-only
 
@@ -279,8 +302,13 @@ WAF `Challenge` (silent, browser-based) is preferable to `CAPTCHA`
 (interactive) for a health product, where accessibility matters and an
 interactive puzzle in front of someone seeking urgent guidance is harmful.
 Deploy neither at launch. If automated abuse appears, apply `Challenge` to the
-chat route only, never to `/health`, and never in a path that could delay
-emergency routing.
+**chat route only** and never to `/health`, so availability checking never
+depends on passing a challenge.
+
+A challenge cannot be waived for urgent messages — WAF acts before anything
+reads the content (§5). That is why emergency guidance is permanently visible
+in the page and repeated in every `403`, `429`, `5xx`, and timeout fallback,
+rather than relying on the request succeeding.
 
 ### Logging note
 
@@ -315,25 +343,79 @@ per-user quota.
 
 | Limit | Value | Enforced where |
 | --- | --- | --- |
-| Maximum request body | **4 KB** | API Gateway request validation **and** application |
-| Maximum user message length | **2,000 characters** | JSON Schema `maxLength` **and** application |
-| Maximum fields per request | schema-fixed, `additionalProperties: false` | JSON Schema |
-| Required content type | `application/json` only | API Gateway and application |
+| Maximum request body | **4,096 bytes** | **WAF `SizeConstraintStatement`** — *not* request validation |
+| Maximum user message length | **2,000 characters** | API Gateway JSON Schema `maxLength` **and** application |
+| Request object shape | fixed, `additionalProperties: false` | API Gateway JSON Schema **and** application |
+| Required content type | `application/json` only | API Gateway method config **and** application |
+| Maximum request body, byte-exact | **4,096 bytes UTF-8** | Application |
 | Maximum response tokens | see §12 | Application |
 | Per-request timeout | 15 s Lambda / 29 s API Gateway ceiling | Both |
 
-Enforcing in both places is deliberate. The edge check is the cheap one; the
-application check is the one that still holds if the endpoint is ever reached
-by another path. Neither is redundant.
+### Body size is a WAF rule, not request validation
+
+An earlier draft of this ADR attributed the body-size cap to API Gateway
+request validation. That was wrong and is corrected here:
+
+> **API Gateway request validation cannot enforce a maximum body size.** It
+> validates against a JSON Schema model, and JSON Schema has no body-size
+> keyword. API Gateway's only size limit is its own 10 MB payload ceiling,
+> which is far too large to be useful as a control.
+
+The three enforcement points, each doing a job the others cannot:
+
+| Control | Mechanism | Catches |
+| --- | --- | --- |
+| **WAF `SizeConstraintStatement`** | `BODY` field, `GT` 4096 bytes → `Block` | Oversized bodies, before validation or Lambda |
+| **API Gateway JSON Schema** | `maxLength: 2000` on the message property, `additionalProperties: false` | Over-length messages and unexpected fields |
+| **Application** | UTF-8 **byte size** *and* **character length**, checked separately | Everything, on any path, including a future non-gateway caller |
+
+The application must check **both** byte size and character length. They are
+not the same measure: 2,000 characters of multi-byte UTF-8 — emoji, accented
+text, or non-Latin scripts, all plausible in a health description — can exceed
+4,096 bytes while passing a character-count check, and a byte check alone would
+reject legitimate accented prose well short of 2,000 characters. Checking one
+and inferring the other is how this class of limit is usually got wrong.
+
+### Unsupported content types must be rejected explicitly
+
+Rejection is configured, not assumed:
+
+- The method accepts **`application/json` only**. Any other `Content-Type` is
+  rejected with `415` before the integration is reached.
+- The application re-checks the content type, so the rule holds on any path.
+
+### The request-validation gap that must be closed
+
+> **API Gateway skips request-model validation when no model matches the
+> request's content type.** A request arriving with an unmapped `Content-Type`
+> passes through unvalidated unless passthrough is explicitly blocked.
+
+Two settings close it, and both are required:
+
+1. Register the model against the `$default` content-type key, **or** set
+   passthrough behaviour to `NEVER` so an unmapped content type is rejected
+   rather than forwarded unvalidated.
+2. Enable **"Validate body"** on the method request — validation is off by
+   default, and a model attached without it does nothing.
+
+Without both, an attacker sends `Content-Type: text/plain`, the model is never
+consulted, and the body reaches Lambda unvalidated. The WAF size rule and the
+application checks still hold, which is precisely why the design does not rely
+on any single layer.
+
+Enforcing in several places is deliberate. The edge checks are the cheap ones;
+the application checks are the ones that still hold if the endpoint is reached
+by another path, or if a gateway setting is later changed by mistake.
 
 ### Response behaviour
 
 | Condition | Status | Body |
 | --- | --- | --- |
 | Throttled | `429` with `Retry-After` | Generic. No quota internals. |
-| Body too large | `413` | Generic. |
+| Body over 4,096 bytes, caught by WAF | `403` | WAF default. The edge case, and the common one. |
+| Body over 4,096 bytes, caught by the application | `413` | Generic. Only reachable if WAF is bypassed or misconfigured. |
 | Message too long | `400` | States the character limit only. |
-| Wrong content type | `415` | Generic. |
+| Wrong or unmapped content type | `415` | Generic. |
 | Malformed JSON | `400` | Generic. No parser detail. |
 | Secret unresolvable (internal routes) | `503` | Opaque, as today. |
 | WAF block | `403` | WAF default. Never echoes the matched rule. |
@@ -403,10 +485,40 @@ only in prompt text. A prompt is guidance; a response filter is a control.
 - **No lab interpretation** — no reading, scoring, or explaining a user's own
   labs, imaging, or test values.
 - **No clinician-patient relationship** is created.
-- **Emergency and red-flag routing stays prominent.** Urgent symptoms are
-  directed to live care immediately and are never triaged by the product. This
-  path must not be gated behind a challenge, a rate limit response, or a
-  degraded-mode fallback.
+- **Emergency and red-flag routing stays prominent** — and its architecture is
+  corrected below, because an earlier draft of this ADR got it wrong.
+
+### Emergency routing must not depend on the API
+
+An earlier draft said the emergency path "must not be gated behind a challenge,
+a rate limit response, or a degraded-mode fallback". That is not
+implementable, and stating it would have produced a dangerous design.
+
+> **A request carrying emergency language cannot bypass WAF, throttling, or a
+> challenge.** WAF and API Gateway act on the request *before* anything reads
+> the message. Nothing at the edge knows the content is urgent, and building a
+> bypass that inspected content ahead of the abuse controls would be both a
+> security hole and unreliable exactly when the service is under load.
+
+Emergency guidance is therefore designed to **never depend on a successful API
+call**:
+
+| Where | Requirement |
+| --- | --- |
+| Squarespace UI | Emergency guidance is **permanently visible** — static page content, rendered before and independently of any API call, never hidden behind a control or an interaction |
+| `403` (WAF block or challenge) | Client-side fallback shows the same emergency guidance |
+| `429` (throttled) | Same guidance |
+| `5xx` (including `503`) | Same guidance |
+| Timeout or network failure | Same guidance |
+| `/health` | Stays outside any chat-route challenge or CAPTCHA rule, so availability checking never depends on passing a challenge |
+
+The guidance a user in an emergency needs is thereby present when the API is
+throttled, blocked, failing, or entirely down — which is precisely when a
+content-inspecting bypass would have failed them. The static path is the
+reliable one.
+
+Response-side boundary enforcement still applies to successful calls; this
+section is about what happens when there is no successful call.
 - **Clinical services are limited to eligible Indiana patients**; educational
   content is not geographically limited. Wording is an owner decision (§15).
 
@@ -526,15 +638,30 @@ Enforce it in **one** place: the application, which already has
 `CORSMiddleware` configured and tested. Configuring CORS in both API Gateway
 and the application creates two sources of truth that drift, and the failure
 mode — a preflight answered by the gateway with a policy the application does
-not share — is confusing to diagnose. API Gateway passes `OPTIONS` through to
-the Lambda proxy integration, so the application answers preflight directly.
+not share — is confusing to diagnose.
+
+For the application to answer preflight, `OPTIONS` must actually reach it. On a
+REST API that is **not automatic**: unless the resource uses `ANY` on a
+`{proxy+}` greedy path, or an explicit `OPTIONS` method is defined and wired to
+the same integration, API Gateway answers `OPTIONS` itself — typically with
+`403` — and the preflight fails before the application is consulted. Configure
+the proxy resource with `ANY`, and verify preflight end to end rather than
+assuming it passes through.
 
 ### Preflight behaviour
 
-A compliant `OPTIONS` request from an allowed origin returns `204` with the
-allowed methods, allowed headers, and max-age. From a disallowed origin it
-returns without the `Access-Control-Allow-Origin` header, so the browser blocks
-the follow-up request. Tests in §13.
+An allowed `OPTIONS` request returns **`200`**, not `204`, carrying the allowed
+methods, allowed headers, and max-age.
+
+That is Starlette's `CORSMiddleware` behaviour, which the application already
+uses: it answers a valid preflight with `200` and a plain-text body. `204` is
+what many CORS implementations return and what an earlier draft of this ADR
+specified, but asserting `204` against the middleware we actually run would
+fail. If `204` is wanted it has to be implemented deliberately — it is not the
+default, and there is no reason to prefer it.
+
+From a disallowed origin the response carries no `Access-Control-Allow-Origin`
+header, so the browser blocks the follow-up request. Tests in §13.
 
 ### Restating the limit
 
@@ -649,6 +776,38 @@ today, then `sam deploy` a template that references it. The existing validation
 in `scripts/deploy-lambda.sh` — `APP_ENV`, `GG_API_SECRET_ID`, no stale
 `GG_API_KEY` — should be preserved as a pre-deploy check rather than discarded.
 
+### Two stacks, not one
+
+A single stack would quietly undo the whole permission model. If one template
+owns both the API Gateway and the Lambda code, then whatever can deploy the
+template can also rewrite the WAF association, the resource policies, and the
+IAM roles — through CloudFormation rather than directly, but with exactly the
+same effect. **Infrastructure as code changes how a privilege is exercised, not
+whether it is held.**
+
+| Stack | Owns | Deployed by | Cadence |
+| --- | --- | --- | --- |
+| **Infrastructure stack** | API Gateway, stages, WAF Web ACL and its association, Lambda resource policies, IAM roles and policies, log groups and retention | **Administrator only** | Rarely, deliberately |
+| **Application stack / path** | Lambda code and function configuration — `APP_ENV`, `GG_API_SECRET_ID`, reserved concurrency, memory, timeout | Restricted deployment automation | Every release |
+
+Rules that make the separation real:
+
+1. **Infrastructure changes go through a CloudFormation change set that an
+   administrator reviews and executes.** A change set makes the diff explicit
+   before anything is applied — the reviewable artefact this split depends on.
+2. **Deployment automation must not be able to modify WAF or IAM, directly or
+   indirectly.** That includes indirect paths: no `cloudformation:*` on the
+   infrastructure stack, no `iam:PassRole` to a role that could, and no
+   `sam deploy` against a template containing WAF or IAM resources. The `Deny`
+   in `infrastructure/phase1e/deployment-automation-policy.json` covers the
+   direct actions; the stack split covers the indirect ones.
+3. **The application path deploys code and function configuration only.**
+   Reserved concurrency stays with it deliberately, because setting it to `0`
+   is the emergency kill switch and must not wait for an administrator (§12).
+4. **Cross-stack references are exported by the infrastructure stack and
+   imported by the application path**, never the reverse — so the application
+   path cannot redefine what protects it.
+
 **No infrastructure is created by this ADR.**
 
 ---
@@ -722,12 +881,16 @@ several cannot be written before there is an API to test.
 | --- | --- | --- | --- |
 | 1 | Allowed origin accepted | Planned | `Access-Control-Allow-Origin` matches the configured origin exactly |
 | 2 | Disallowed origin rejected | Planned | No ACAO header returned |
-| 3 | `OPTIONS` preflight | Planned | `204`, correct methods/headers/max-age |
+| 3 | `OPTIONS` preflight | Planned | **`200`** (Starlette `CORSMiddleware`), correct methods/headers/max-age |
+| 3a | `OPTIONS` reaches the application | Planned | Preflight is answered by the app, not by API Gateway returning `403` |
 | 4 | Wildcard origin never used | **Static** | No `*` in the origin configuration |
 | 5 | Credentials disabled | **Static** | `allow_credentials=False` |
-| 6 | Oversized body | Planned | `413`, Lambda not invoked |
+| 6 | Oversized body | Planned | `403` from the WAF size rule, Lambda not invoked |
+| 6a | Oversized body with WAF bypassed | Planned | Application returns `413` — the second layer holds |
+| 6b | Byte size vs character length | Planned | 2,000 multi-byte characters exceeding 4,096 bytes are rejected |
 | 7 | Excessive message length | Planned | `400`, states the limit only |
 | 8 | Invalid content type | Planned | `415` |
+| 8a | Unmapped content type does not skip validation | Planned | `text/plain` body is rejected, not forwarded unvalidated |
 | 9 | Malformed JSON | Planned | `400`, no parser detail leaked |
 | 10 | Unicode and emoji input | Planned | Handled correctly; length counted in characters |
 | 11 | Rate limiting | Planned | `429` with `Retry-After` past the documented rate |
@@ -739,6 +902,9 @@ several cannot be written before there is an API to test.
 | 17 | Anonymous endpoint behaviour | Planned | Public routes work with no credential; gated routes return `401` |
 | 18 | Authenticated behaviour | Planned | Only if accounts are adopted (§15) |
 | 19 | Emergency language routing | Planned | Red-flag phrasings produce prominent live-care routing, never triage |
+| 19a | Emergency guidance survives failure | Planned | The same guidance appears in `403`, `429`, `5xx`, and timeout fallbacks |
+| 19b | Emergency guidance is static | Planned | Visible in the page without any API call succeeding |
+| 19c | `/health` outside challenge rules | Planned | `/health` is reachable without passing a challenge |
 | 20 | Boundary enforcement | Planned | No diagnosis, prescribing, treatment plan, or lab interpretation in any response |
 | 21 | Injection and prompt-manipulation resistance | Planned | Instruction-override attempts do not breach the boundaries in §5 |
 | 22 | Infrastructure templates carry no real account IDs | **Static** | Placeholders only |
@@ -818,9 +984,71 @@ Every action, separated by who performs it.
 
 None of these should be decided by Claude. Each changes the design materially.
 
+Decisions **L1** and **L2** are **launch-blocking**: the endpoint must not
+accept public traffic until both are resolved. They are listed first because
+they can invalidate design choices below them.
+
+### L1 — Legal and compliance determination *(launch-blocking)*
+
+**A qualified legal review must determine the service's obligations before
+launch.** This ADR does not, and cannot, settle them.
+
+Scope of the review, at minimum:
+
+- **HIPAA** — whether Graceful Health's activities make this a covered entity's
+  system, or bring it into scope through the clinical side of the business.
+- **Business-associate obligations** — whether a BAA is required with any
+  provider in the data path, including the model provider (L2).
+- **FTC Health Breach Notification Rule** — which reaches consumer health
+  applications that are **not** HIPAA-covered, and is the rule most often
+  missed by products that conclude "we are outside HIPAA".
+- **State law**, including Indiana requirements attaching to the clinical side.
+- **Privacy policy** — accurate disclosure of what is and is not collected.
+- **Consent** — what, if anything, must be presented and recorded before a user
+  submits free text.
+
+> **This ADR does not state that the service is outside HIPAA.** The repository
+> is *designed* so that no HIPAA-covered data path exists — no accounts, no
+> persistence, no identifying data, no logged content — and that design intent
+> is recorded in `CLAUDE.md`. Whether that intent holds as a legal conclusion
+> is a question for counsel, not for an architecture document, and "we designed
+> it not to be covered" is not a determination. Being outside HIPAA would also
+> not end the analysis: the FTC rule above applies precisely to products in
+> that position.
+
+Design implication: the no-persistence, no-identifying-data, no-content-logging
+choices throughout this ADR are what keep the answer as simple as possible. Any
+decision that reverses one of them — accounts (§15.1), conversation history
+(§15.7), IP retention (§15.4) — reopens L1 and must be re-reviewed.
+
+### L2 — Model-provider data-flow determination *(launch-blocking)*
+
+Free text leaves our infrastructure the moment it reaches a model provider.
+That path must be settled, in writing, before any public traffic:
+
+| Question | Why it matters |
+| --- | --- |
+| **Which provider**, and which model | Everything below depends on it |
+| **BAA availability** | Whether a business-associate agreement can be executed at all, if L1 finds one is needed |
+| **Retention** | How long prompts and completions are held provider-side |
+| **Training use** | Whether submitted content may train models — must be **no** |
+| **Zero-data-retention terms** | Whether ZDR is available, and on what tier or contract |
+| **Subprocessors** | Who else in the provider's chain sees the content |
+| **Region and residency** | Where inference and any retention physically occur |
+| **Deletion** | Whether deletion can be requested, and how it is proven |
+| **Breach handling** | Notification obligations and timelines, provider-side |
+| **Maximum content transmitted** | The most that can ever leave — bounded by the 2,000-character cap (§3), and the reason that cap is a privacy control as well as a cost control |
+
+The no-persistence boundary in §5 governs **our** systems. It says nothing
+about what a provider retains, and a product cannot claim it does not store
+conversations while a provider in its path retains them for thirty days. L2
+resolves that gap.
+
+### Remaining decisions
+
 | # | Decision | Recommendation | Why it needs an owner |
 | --- | --- | --- | --- |
-| 1 | **Does the public beta require accounts?** | **No accounts** | Accounts collect identifying data and create the account-linked history V1 prohibits. Reverses a core product boundary. |
+| 1 | **Does the public beta require accounts?** | **No accounts** | Accounts collect identifying data and create the account-linked history V1 prohibits. Reverses a core product boundary, and reopens L1. |
 | 2 | **Acceptable anonymous usage limit** | 60 chat requests / 5 min / IP; 2 rps steady | Trades user experience against cost exposure. A business call. |
 | 3 | **Exact Squarespace production origin** | Placeholder until supplied | Needed for CORS. Must not be committed until approved. |
 | 4 | **May IP addresses be retained in WAF or access logs?** | API Gateway logs IP-free; WAF logging **off** | WAF logging cannot omit IP. Retention is a privacy decision, not a technical default. |
