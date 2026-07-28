@@ -8,7 +8,7 @@
 - `f4606ffe5a1f75df881eb45375d0055ff77cce71` — *Standardize Claude task reporting workflow*
 - `9f59676a6a721726f42261f943e88a387272ad76` — *Fix PowerShell Git stderr handling*
 
-**Report commits:** `85b0ee3` — *Document reporting workflow*; and the commit adding the correction section below — *Document report helper compatibility fix*
+**Report commits:** `85b0ee3` — *Document reporting workflow*; `837481b` — *Document report helper compatibility fix*; and the commit adding the Windows validation section below — *Record Windows report-helper validation*
 
 This report is redacted by construction: no credential, password, token, API
 key, secret value, secret identifier, account ID, instance ID, full ARN, private
@@ -31,9 +31,11 @@ reports, and static tests locking both in. Repository workflow only.
 both, and all gates pass.
 
 The helper was subsequently found to have a **Windows PowerShell failure** and
-was corrected — see *Correction: PowerShell Git stderr handling* below. The
-limitation recorded under **Blockers** stands: the helper still cannot be
-*executed* on this Linux host.
+was corrected — see *Correction: PowerShell Git stderr handling* below.
+
+That correction has since been **executed and confirmed on Windows**. The
+previously recorded blocker — that the helper had never been run on its target
+platform — is **closed**. See *Windows validation* below.
 
 ---
 
@@ -280,27 +282,96 @@ appeared twice in the Phase 1E review.
 | `git diff --check` | **PASS** |
 | PowerShell structure | **PASS** — braces and parentheses balanced; no here-string terminator indented, which would be a parse error |
 
-### Still not executed
+### Verified on Windows
 
-No PowerShell interpreter exists on this Linux host, so the corrected script was
-verified statically and by thirty content assertions but **never run**. The
-recommended next step is unchanged and now more pointed: run it once on Windows,
-against both a clean and a deliberately dirty working tree, and confirm that a
-successful `git switch` no longer terminates it.
+At the time the correction was written, no PowerShell interpreter existed on
+this Linux host, so the script was verified statically and by thirty content
+assertions but had not been run. **That has since been done on Windows and the
+correction holds.** The results are recorded in *Windows validation* below.
+
+---
+
+## Windows validation
+
+The helper was executed on the target Windows platform. **Both the normal
+retrieval paths and the dirty-working-tree refusal path passed.** This closes
+the only blocker this task carried.
+
+The run was performed by AJ on Windows and reported back to this session; the
+results below are recorded as received. No PowerShell was executed on this Linux
+host, which has no interpreter.
+
+### Results
+
+| Path exercised | Result |
+| --- | --- |
+| Explicit `-ReportPath` workflow | **PASS** — branch retrieved and the named report resolved |
+| Automatic newest-report discovery with `-NoOpen` | **PASS** — most recent report under `docs/audits/` selected, path printed, no editor opened |
+| `NativeCommandError` on successful Git commands | **NONE** — the original failure did not recur |
+| Deliberately dirty working tree | **PASS** — helper refused to proceed and exited **nonzero** |
+| Temporary probe file used to dirty the tree | Removed |
+| Windows working tree after the run | Clean |
+
+### What this confirms
+
+**The stderr fix works on the platform it was written for.** The failure being
+corrected was specific to how Windows PowerShell converts a native command's
+stderr into `ErrorRecord` objects; no amount of static assertion could settle
+it. `git fetch`, `git switch`, and `git pull` all write ordinary progress to
+stderr, and none of them terminated the script.
+
+**The safety guarantee is real, not just asserted.** The dirty-tree check was
+the property most worth proving by execution, because a helper that switched
+branches over uncommitted work would destroy exactly what it was written to
+protect. It refused, and it refused with a nonzero exit status — so a caller
+that chains on it stops rather than continuing against a half-completed run.
+The probe file was removed and the tree left clean, so the check was exercised
+without leaving residue.
+
+**Both report-selection paths work.** The explicit `-ReportPath` form and the
+newest-file fallback were each exercised; a failure in either would have made
+the helper useless for its one purpose.
+
+### Scope of this validation
+
+This was a functional run of the retrieval paths, not an exhaustive matrix. Not
+exercised: a divergent branch hitting the `--ff-only` failure, a missing branch
+name, a missing report path, or a host without `Set-Clipboard`. Each of those is
+covered by static assertion only. They are lower-risk — all three failure paths
+stop the script rather than modify anything — but they remain unproven by
+execution, and this report should not be read as saying otherwise.
+
+### Gate results for this update
+
+This update changes documentation only — no application code, no test, no
+script, and no configuration was touched — so the gates are a regression check
+rather than a verification of new behaviour.
+
+| Gate | Result |
+| --- | --- |
+| `.venv/bin/python -m pytest -q` | **PASS** — 122 passed, 0 failed (no tests added or changed) |
+| `.venv/bin/ruff check backend/` | **PASS** — all checks passed |
+| `.venv/bin/ruff format --check backend/` | **PASS** — 13 files already formatted |
+| `git diff --check` | **PASS** — no whitespace errors |
 
 ---
 
 ## Blockers and unresolved findings
 
-**The PowerShell helper was not executed.** No PowerShell interpreter exists on
-this Linux host, so the script was verified statically — balanced braces and
-parentheses, correct here-string delimiters, and nineteen content assertions —
-but never run.
+**None. The one blocker this task carried is closed.**
 
-This is the same class of gap as the documented Python 3.12/3.13 mismatch: the
-authority on whether it works is a run on the target platform, not this host.
-**Recommended: run it once on Windows before relying on it**, ideally against a
-deliberately dirty working tree to confirm it refuses rather than proceeds.
+It was: *the PowerShell helper had not been executed*, because no PowerShell
+interpreter exists on this Linux host. That was the same class of gap as the
+documented Python 3.12/3.13 mismatch — the authority on whether it works is a
+run on the target platform, not this host. The run has now happened on Windows
+and both the normal paths and the dirty-tree refusal path passed, so the gap is
+closed by execution rather than by assertion. See *Windows validation* above.
+
+The residual, recorded rather than outstanding: the `--ff-only` divergence
+path, the missing-branch path, the missing-report path, and clipboard absence
+are still covered by static assertion only. All four stop the script instead of
+modifying anything, so none of them can lose work — they are noted for accuracy,
+not as pending items.
 
 No other unresolved findings.
 
@@ -318,11 +389,11 @@ compliance determination, and the model-provider data-flow determination).
 
 ## Recommended next step
 
-1. **Run `scripts/pull-task-report.ps1` once on Windows** to close the gap
-   above, including the dirty-tree refusal path.
-2. Merge `chore/claude-report-workflow` to `main`, so the protocol applies to
-   every subsequent task. Not done here — merging requires explicit instruction.
-3. Note that `phase1e-api-gateway-design` is a separate unmerged branch. This
+1. **Merge `chore/claude-report-workflow` to `main`**, so the protocol applies
+   to every subsequent task. This is now the top item: the Windows run was the
+   last thing gating it, and it passed. Not done here — merging requires
+   explicit instruction.
+2. Note that `phase1e-api-gateway-design` is a separate unmerged branch. This
    branch was taken from `main` and does not contain it; the two do not
    conflict, but both are outstanding.
 
