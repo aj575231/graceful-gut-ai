@@ -1,0 +1,64 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IdentityCheck",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    },
+    {
+      "Sid": "InspectAndUpdateTheFunction",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:GetFunctionUrlConfig",
+        "lambda:GetPolicy",
+        "lambda:ListTags",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:PutFunctionConcurrency",
+        "lambda:DeleteFunctionConcurrency",
+        "lambda:InvokeFunction"
+      ],
+      "Resource": "arn:aws:lambda:us-east-2:<AWS_ACCOUNT_ID>:function:graceful-gut-ai-dev-api"
+    },
+    {
+      "Sid": "CreateADeploymentOfAnExistingApiOnly",
+      "Effect": "Allow",
+      "Action": [
+        "apigateway:GET",
+        "apigateway:POST"
+      ],
+      "Resource": [
+        "arn:aws:apigateway:us-east-2::/restapis/<API_ID>/deployments",
+        "arn:aws:apigateway:us-east-2::/restapis/<API_ID>/stages/*"
+      ]
+    },
+    {
+      "Sid": "PassOnlyTheApplicationExecutionRole",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:PassRole"
+      ],
+      "Resource": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/GracefulGutAI-LambdaExecutionRole"
+    },
+    {
+      "Sid": "DenyEverythingThatRemovesProtection",
+      "Effect": "Deny",
+      "Action": [
+        "lambda:AddPermission",
+        "lambda:RemovePermission",
+        "lambda:CreateFunctionUrlConfig",
+        "lambda:UpdateFunctionUrlConfig",
+        "lambda:DeleteFunctionUrlConfig",
+        "wafv2:*",
+        "apigateway:DELETE",
+        "secretsmanager:*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
