@@ -170,8 +170,15 @@ prints an eight-character prefix only.
 | This report — correction review added | the commit adding this section | *Document Phase 1E correction review* |
 
 A report cannot contain its own commit hash, so the row above names the commit
-that added this section rather than quoting it. The two substantive commits are
-`bee683e` and `82d045e`.
+that added this section rather than quoting it.
+
+The two commits that changed the architecture are `bee683e` and `8b5cd35` —
+the design, and the corrections that followed the review. `82d045e` is a
+**report** commit and changed no design artefact. An earlier version of this
+sentence named `bee683e` and `82d045e` as the substantive pair, which conflated
+the report with the work and left `8b5cd35` — the commit carrying nine
+corrections, two of which would otherwise have produced a broken design —
+unlisted. Corrected in Phase 1F.
 
 **Branch:** `phase1e-api-gateway-design`, pushed to `origin` and tracking
 `origin/phase1e-api-gateway-design`. The initial push created the remote branch
