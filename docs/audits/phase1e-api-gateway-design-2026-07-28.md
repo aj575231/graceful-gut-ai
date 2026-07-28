@@ -153,6 +153,26 @@ prints an eight-character prefix only.
 
 ---
 
+## Commit hashes and push
+
+| Role | Commit | Message |
+| --- | --- | --- |
+| Design and tests | `bee683e074066a0ac381f65b93dcd4eef3c7ae2e` | *Design Phase 1E API Gateway architecture* |
+| This report | `82d045e` | *Document Phase 1E architecture review* |
+| This report — commit-hash record added | the commit adding this section | *Record Phase 1E commit hashes and push confirmation* |
+
+A report cannot contain its own commit hash, so the row above names the commit
+that added this section rather than quoting it. The two substantive commits are
+`bee683e` and `82d045e`.
+
+**Branch:** `phase1e-api-gateway-design`, pushed to `origin` and tracking
+`origin/phase1e-api-gateway-design`. The initial push created the remote branch
+and reported no errors.
+
+Nothing was merged to `main`. Nothing was deployed.
+
+---
+
 ## Decisions required from AJ and Jenna
 
 None of these should be decided by Claude. Each changes the design materially.
