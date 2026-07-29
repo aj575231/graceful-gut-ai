@@ -15,6 +15,85 @@ Region is `us-east-2` throughout.
 
 ---
 
+## The first administrator attempt was BLOCKED
+
+**Status of the Phase 1F dry run: not completed. No CloudFormation stack and no
+change set has ever existed for this template, and no infrastructure has been
+created.**
+
+The first attempt, on Windows, ran the commands in this file by hand and failed
+in four steps that are worth reading before the second attempt, because three
+of them are properties of the procedure rather than of the account:
+
+1. `aws apigateway get-account` returned no `cloudwatchRoleArn` — prerequisite 2
+   below was not satisfied. The check itself worked and raised an error.
+2. **The remaining commands were pasted and executed separately anyway.** A
+   failed prerequisite in a pasted sequence stops nothing; the next command is
+   already on the clipboard.
+3. The parameter file was passed as `file:///C:/Users/...`. The AWS CLI rejects
+   that as an invalid Windows path — see "Parameter files on Windows" below —
+   so `create-change-set` never succeeded.
+4. Because no change set and no stack were created, the later `describe` and
+   `delete` calls failed for that reason and not for any reason to do with the
+   template. The template has still never been checked against real
+   CloudFormation.
+
+The attempt nevertheless **wrote a review file recording PASS and printed
+cleanup success messages**, for stages that had not run and objects that had
+never existed. That review was invalid and has been deleted. Nothing in this
+repository should be read as evidence that the template has been checked
+against real CloudFormation — that check has not been performed.
+
+The two scripts in the next section exist so that none of steps 2 through 4 can
+happen again. **Use them instead of pasting the commands below.**
+
+---
+
+## Preferred Windows workflow — use the scripts
+
+The commands in sections 1 through 5 remain the reference for what is being
+done and why. On Windows, run them through these two scripts instead of by
+hand. Both are PowerShell 5.1 and 7 compatible.
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/setup-apigw-cloudwatch-role.ps1` | One-time prerequisite: the account-level API Gateway CloudWatch role. Plans by default; changes nothing without `-Apply` |
+| `scripts/admin-dry-run.ps1` | The full dry run: prerequisites, parameter file, `validate-template`, a CREATE change set, assertions, review, and cleanup of both objects it creates |
+
+```powershell
+# 1. Prerequisite. Plan first -- this reads and reports, and changes nothing.
+.\scripts\setup-apigw-cloudwatch-role.ps1
+.\scripts\setup-apigw-cloudwatch-role.ps1 -Apply
+
+# 2. The dry run. Creates a change set, reviews it, deletes it.
+#    It never executes a change set.
+.\scripts\admin-dry-run.ps1 -ProductionOrigin https://<approved-origin>
+```
+
+What `admin-dry-run.ps1` enforces that a pasted sequence cannot:
+
+- **It aborts the entire run on the first failure.** There is no next command
+  for anyone to paste. A failed prerequisite ends the script.
+- It checks **every** AWS call by exit code, not by whether output appeared.
+- It never continues into change-set validation after `create-change-set`
+  fails, and **writes no review file for a run that did not complete**.
+- It never calls `execute-change-set` — the string does not appear in the file.
+- `PASS` is produced in exactly one function, from a boolean that was actually
+  computed. `REMOVED` is produced in exactly one function, and only when the
+  object was observed to exist and was then confirmed gone.
+- It deletes the completed parameter file in a `finally` block, so it goes even
+  when the run fails.
+
+### Do not continue by hand after a failure
+
+If either script stops, **fix the reported cause and re-run the script**. Do
+not paste the individual commands to get past the step that failed. That is
+precisely what turned a correctly-detected missing prerequisite into a review
+file claiming PASS. A failed step means the run has no result, not that the run
+needs help continuing.
+
+---
+
 ## 0. Prerequisites
 
 Confirm each before the first `create-change-set`. Two of them are
@@ -36,7 +115,54 @@ aws apigateway get-account --region us-east-2 --query cloudwatchRoleArn --output
 ```
 
 An empty result means access logs and execution logs will be configured on the
-stage and never written.
+stage and never written. **This is the check that failed on the first attempt.**
+It is the expected first-attempt failure, not a surprise, and
+`scripts/setup-apigw-cloudwatch-role.ps1` exists to satisfy it:
+
+```powershell
+.\scripts\setup-apigw-cloudwatch-role.ps1          # plan: reports, changes nothing
+.\scripts\setup-apigw-cloudwatch-role.ps1 -Apply   # creates the role and sets the account value
+```
+
+It creates one role trusting only `apigateway.amazonaws.com`, attaches only
+`arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs`,
+sets the account value, and reads it back to verify. If a role of that name
+already exists with a different trust policy or extra attached policies, it
+**stops rather than overwriting it** — a role this procedure does not own may be
+serving something else.
+
+---
+
+## 0a. Parameter files on Windows
+
+This is a small syntax detail that cost the whole first attempt, so it gets its
+own section.
+
+The AWS CLI's `file://` prefix takes **a path, not a URI**. On Windows that
+means two slashes and native separators:
+
+| | |
+| --- | --- |
+| **Correct** | `--parameters file://C:\Users\you\AppData\Local\Temp\parameters.json` |
+| **Rejected** | `--parameters file:///C:/Users/you/AppData/Local/Temp/parameters.json` |
+
+The rejected form is what PowerShell produces if the path is converted to a URI
+— `[System.Uri]::new($path).AbsoluteUri` and several path-formatting helpers all
+yield `file:///C:/...` with three slashes and forward separators. The CLI
+reports it as an invalid Windows path, and `create-change-set` never runs. Do
+not convert the path; pass it as the operating system writes it.
+
+Two further rules for the completed parameter file:
+
+- **It never goes inside the repository.** It carries the account ID in the
+  function ARN and the approved production origin. Write it under `%TEMP%` and
+  delete it afterwards. `admin-dry-run.ps1` writes it to `%TEMP%`, refuses to
+  run if `%TEMP%` resolves inside the checkout, and deletes it in a `finally`
+  block.
+- **UTF-8 without a byte order mark.** `Set-Content -Encoding UTF8` on Windows
+  PowerShell 5.1 writes a BOM, and a BOM makes the CLI's JSON parser fail on the
+  first character — which reads like a malformed parameter file rather than an
+  encoding problem.
 
 ---
 
@@ -47,7 +173,9 @@ the diff explicit before anything is applied, and that reviewable artefact is
 the whole basis of the administrator/application split.
 
 ```bash
-# 1a. Validate the template locally. Reads nothing, changes nothing.
+# 1a. Validate the template. NOT a local parse -- this is an AWS API call.
+#     It requires credentials, it is billable API activity, and it cannot be
+#     run offline or without a resolved profile. It creates nothing.
 aws cloudformation validate-template \
   --region us-east-2 \
   --template-body file://infrastructure/phase1f/template.yaml
@@ -87,7 +215,49 @@ aws cloudformation describe-change-set \
 - No `AWS::WAFv2::LoggingConfiguration` appears.
 - No `AWS::Budgets::Budget` appears.
 
-Then, and only then:
+### A CREATE change set leaves an empty stack behind
+
+`--change-set-type CREATE` creates the stack record **before** the change set
+exists, in status `REVIEW_IN_PROGRESS`, holding no resources. This has two
+consequences that the first attempt would have run into next:
+
+- **Deleting the change set is not enough.** `delete-change-set` removes the
+  change set and leaves the empty `REVIEW_IN_PROGRESS` stack record holding the
+  stack name. The next `create-change-set --change-set-type CREATE` with that
+  name then fails, and the cause is not obvious.
+- **The record can exist even when `create-change-set` failed.** The stack is
+  created first, so a change set that fails to build still leaves the record.
+
+A dry run that is not executed must therefore delete **both**:
+
+```bash
+# 1. The unexecuted change set.
+aws cloudformation delete-change-set \
+  --region us-east-2 \
+  --stack-name <STACK_NAME> \
+  --change-set-name phase1f-create
+
+# 2. The empty stack record it left behind.
+aws cloudformation delete-stack \
+  --region us-east-2 --stack-name <STACK_NAME>
+
+aws cloudformation wait stack-delete-complete \
+  --region us-east-2 --stack-name <STACK_NAME>
+
+# 3. Confirm absence by reading it back. Do not infer it from step 2 exiting 0.
+aws cloudformation list-stacks \
+  --region us-east-2 \
+  --stack-status-filter CREATE_COMPLETE REVIEW_IN_PROGRESS CREATE_FAILED \
+                        ROLLBACK_COMPLETE DELETE_FAILED \
+  --query "StackSummaries[?StackName=='<STACK_NAME>'].StackStatus" --output text
+```
+
+An empty result from step 3 is the only evidence that cleanup worked. Deleting
+something that was never there is not a success, and must not be reported as
+one — `admin-dry-run.ps1` distinguishes `REMOVED` from `NOT PRESENT` for exactly
+this reason.
+
+Then, and only then — and **not** during a dry run:
 
 ```bash
 aws cloudformation execute-change-set \
@@ -225,7 +395,7 @@ Ordered by how much they give back and how fast.
 
 | Situation | Action |
 | --- | --- |
-| Change set looks wrong before execution | `aws cloudformation delete-change-set` — nothing was applied |
+| Change set looks wrong before execution | `delete-change-set`, then `delete-stack` for the empty `REVIEW_IN_PROGRESS` record — nothing was applied, but both objects must go |
 | Update failed mid-flight | CloudFormation rolls back automatically; confirm with `describe-stack-events` and read the first `*_FAILED` reason, not the last |
 | Update succeeded but behaves wrongly | Create a change set restoring the previous template revision from Git, review, execute, then **create a new deployment** — the rollback has the same immutability problem as the change |
 | A WAF rule blocks legitimate traffic | Set the offending group's `OverrideAction` back to `Count`, or exclude the specific rule IDs. **Never disable a whole rule group** and never disassociate the Web ACL |
