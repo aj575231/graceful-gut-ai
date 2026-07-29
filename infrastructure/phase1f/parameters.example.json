@@ -1,0 +1,62 @@
+[
+  {
+    "ParameterKey": "ApplicationFunctionArn",
+    "ParameterValue": "arn:aws:lambda:us-east-2:<AWS_ACCOUNT_ID>:function:graceful-gut-ai-dev-api"
+  },
+  {
+    "ParameterKey": "StageName",
+    "ParameterValue": "dev"
+  },
+  {
+    "ParameterKey": "AccessLogRetentionDays",
+    "ParameterValue": "14"
+  },
+  {
+    "ParameterKey": "ProductionOrigin",
+    "ParameterValue": "<SQUARESPACE_PRODUCTION_ORIGIN>"
+  },
+  {
+    "ParameterKey": "DevelopmentOrigin",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "EnableEducationRoute",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "StageThrottleRateLimit",
+    "ParameterValue": "5"
+  },
+  {
+    "ParameterKey": "StageThrottleBurstLimit",
+    "ParameterValue": "10"
+  },
+  {
+    "ParameterKey": "HealthRouteRateLimit",
+    "ParameterValue": "20"
+  },
+  {
+    "ParameterKey": "HealthRouteBurstLimit",
+    "ParameterValue": "40"
+  },
+  {
+    "ParameterKey": "EducationRouteRateLimit",
+    "ParameterValue": "1"
+  },
+  {
+    "ParameterKey": "EducationRouteBurstLimit",
+    "ParameterValue": "2"
+  },
+  {
+    "ParameterKey": "WafOverallRateLimit",
+    "ParameterValue": "300"
+  },
+  {
+    "ParameterKey": "WafEducationRouteRateLimit",
+    "ParameterValue": "100"
+  },
+  {
+    "ParameterKey": "WafRateRuleAction",
+    "ParameterValue": "Count"
+  }
+]

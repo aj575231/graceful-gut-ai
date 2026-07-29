@@ -333,11 +333,27 @@ targets to be met.
 | `GET /version` | 2 rps / burst 5 | 2 rps / burst 5 | Remains gated (§4). |
 | `POST /v1/education/ask` | **1 rps / burst 2** | **2 rps / burst 5** | The only route that costs model spend. Tightest limit. |
 | WAF rate-based, per IP, whole API | 300 / 5 min | 300 / 5 min | Catches crude flooding. |
-| WAF rate-based, per IP, chat route | 40 / 5 min | 60 / 5 min | ~12 messages/minute sustained — well above human use. |
+| WAF rate-based, per IP, chat route | ~~40 / 5 min~~ | ~~60 / 5 min~~ | **Superseded — not expressible.** See F2 below. |
 
 WAF rate-based rules evaluate over a rolling five-minute window and act with
 some lag; they are a blunt instrument against sustained flooding, not a precise
 per-user quota.
+
+> **Superseded by owner decision F2, approved 2026-07-29.** AWS WAF will not
+> accept a rate-based limit below **100** per evaluation window, so neither 40 nor
+> 60 is expressible as written. The approved arrangement inverts which control is
+> primary:
+>
+> | Control | Approved value | Role |
+> | --- | --- | --- |
+> | `POST /v1/education/ask` per-method throttle | **1 rps / burst 2** | **Primary** |
+> | WAF rate-based rule, education route, per IP | **100 / 5 min** | **Backstop** — 100 is the AWS floor, not a chosen number |
+>
+> `WafRateRuleAction` may remain `Count` while `EnableEducationRoute=false`, and
+> **must be `Block` before public education traffic is enabled.** The dev value
+> for the education route throttle in the row above (1 rps / burst 2) is the
+> approved value; the public-beta figure of 2 rps / burst 5 is **not** approved and
+> needs its own decision, which is moot until launch approval exists.
 
 ### Request size and length caps
 
@@ -602,6 +618,11 @@ whether abuse controls work.
 Recommended default until decided: API Gateway access logs with an IP-free
 format; WAF logging **off**; sampled requests reviewed in the console during
 the count-mode rollout and not exported.
+
+**Decided in part by F1 (2026-07-29):** that default is approved, with sampling
+scoped to private dev and count-mode validation on **synthetic** traffic, to be
+re-evaluated before real public health questions are accepted. WAF logging stays
+**off** and unapproved.
 
 Retention: CloudWatch log retention is currently 14 days. Recommend 14 days for
 application logs and 30 days maximum for anything security-relevant. Owner
@@ -1044,14 +1065,33 @@ about what a provider retains, and a product cannot claim it does not store
 conversations while a provider in its path retains them for thirty days. L2
 resolves that gap.
 
+### Phase 1F owner decisions — approved 2026-07-29
+
+Four decisions arising from building the Phase 1F stack were approved on
+2026-07-29. They are recorded in full in
+`infrastructure/phase1f/administrator-runbook.md` section 0b; their effect on
+this ADR is noted here and inline above.
+
+| # | Approved | Effect on this ADR |
+| --- | --- | --- |
+| **F1** | WAF **sampled requests** approved for private dev and count-mode validation using **synthetic** traffic. Re-evaluate before accepting real public health questions | **Partially decides decision 4 below.** Scoped to synthetic traffic, so no member of the public appears in a sample. WAF **logging** stays off and is still not approved |
+| **F2** | Education route throttle **1 rps / burst 2** as the primary control; WAF rate-based limit **100 / 5 min** as a backstop; `Count` acceptable while the route is off; **`Block` required before public education traffic** | **Supersedes the chat-route rows of §3** and partially decides decision 2 below |
+| **F3** | `StageName=dev`; stack name **`graceful-gut-ai-dev-infrastructure`** | Names the first deployment. No ADR conflict |
+| **F4** | **AJ** is the named administrator who reviews and executes infrastructure change sets, from the Windows administrator session | Confirms the administrator/application split §10 and §11 depend on |
+
+**None of the four is a launch approval.** L1 and L2 below remain open and remain
+launch-blocking, as do the `X-GG-Key` replacement, boundary enforcement in the
+request path, public launch approval itself, and the
+`GracefulGutAI-LambdaExecutionRole` audit (§10, "Still unaudited").
+
 ### Remaining decisions
 
 | # | Decision | Recommendation | Why it needs an owner |
 | --- | --- | --- | --- |
 | 1 | **Does the public beta require accounts?** | **No accounts** | Accounts collect identifying data and create the account-linked history V1 prohibits. Reverses a core product boundary, and reopens L1. |
-| 2 | **Acceptable anonymous usage limit** | 60 chat requests / 5 min / IP; 2 rps steady | Trades user experience against cost exposure. A business call. |
+| 2 | **Acceptable anonymous usage limit** | 60 chat requests / 5 min / IP; 2 rps steady | **Partially decided by F2** — 1 rps / burst 2 with a 100 / 5 min WAF backstop is approved for dev. The public-beta limit is still an owner call, and still trades user experience against cost exposure. |
 | 3 | **Exact Squarespace production origin** | Placeholder until supplied | Needed for CORS. Must not be committed until approved. |
-| 4 | **May IP addresses be retained in WAF or access logs?** | API Gateway logs IP-free; WAF logging **off** | WAF logging cannot omit IP. Retention is a privacy decision, not a technical default. |
+| 4 | **May IP addresses be retained in WAF or access logs?** | API Gateway logs IP-free; WAF logging **off** | **Partially decided by F1** — sampled requests approved for private dev and count-mode validation on synthetic traffic only, and to be re-evaluated before real public health questions are accepted. WAF **logging** remains off and unapproved: it cannot omit IP. Retention for real user traffic is still undecided. |
 | 5 | **Data-retention period** | 14 days application, 30 days security maximum | Privacy posture and any future compliance commitment. |
 | 6 | **Emergency-routing language** | Clinician-authored, prominent, never triage | Must be written or approved by a clinician. Highest-risk copy in the product. |
 | 7 | **Will any conversation history exist?** | **No history in beta** | Multi-turn context changes the data-path analysis and may create a health-data path. |
