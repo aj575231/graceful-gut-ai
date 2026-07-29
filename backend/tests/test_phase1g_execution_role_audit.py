@@ -577,12 +577,15 @@ def test_both_policy_document_encodings_are_handled() -> None:
 
 def test_scalar_and_array_policy_fields_are_both_handled() -> None:
     """Action, Resource, and Statement are each valid as a scalar or a list.
-    Code that assumes a list silently skips single-value statements."""
-    helper = AUDIT_TEXT[AUDIT_TEXT.index("function Get-AsArray") :]
-    helper = helper[: helper.index("# ---")]
+    Code that assumes a list silently skips single-value statements.
 
-    assert "$Value -is [string]" in helper
+    The explicit ``$Value -is [string]`` branch the first version carried is
+    gone: ``@($string)`` already yields a one-element array, so the branch was
+    dead code that implied strings needed special handling when the real hazard
+    was the function boundary. See the collection-handling section below.
+    """
     assert AUDIT_CODE.count("Get-AsArray") >= 8
+    assert "Write-Output -NoEnumerate @($Value)" in AUDIT_CODE
 
 
 def test_the_expected_inline_policy_name_is_the_documented_one() -> None:
@@ -1043,3 +1046,495 @@ def test_the_identifier_detectors_match_planted_inputs() -> None:
         r"arn:aws[a-z0-9-]*:[^\s:]*:[^\s:]*:(\d{12}):",
         "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs",
     )
+
+
+# ---------------------------------------------------------------------------
+# Collection handling. Added after the first administrator run failed with
+# "The property 'Count' cannot be found on this object."
+#
+# Root cause: a PowerShell function cannot return an array by writing
+# `return @($x)`. The return value travels through the pipeline, which
+# enumerates it -- a one-element array arrives at the caller as the bare
+# element, and an empty array arrives as nothing. Get-AsArray, whose entire job
+# was to guarantee an array, therefore returned a scalar whenever it was handed
+# one item. The audited role has exactly one attached managed policy.
+#
+# The script cannot be executed here, so this section pins the fix two ways: a
+# model of the PowerShell semantics that proves why the pattern is correct, and
+# structural guards that every site actually uses that pattern.
+# ---------------------------------------------------------------------------
+
+
+class _Nothing:
+    """The empty pipeline -- what PowerShell delivers for a 0-element return."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<nothing>"
+
+
+NOTHING = _Nothing()
+
+
+def ps_array_subexpression(value: object) -> object:
+    """Model of PowerShell's ``@(...)`` array subexpression.
+
+    Note the trap this models faithfully: ``@($null)`` is a **one**-element
+    array containing $null, not an empty one. That is why the $null case has to
+    be handled inside the normaliser and cannot be fixed by wrapping at the
+    call site.
+    """
+    if isinstance(value, _Nothing):
+        return []
+    if isinstance(value, list):
+        return list(value)
+    return [value]
+
+
+def ps_pipeline_return(value: object) -> object:
+    """Model of what ``return <collection>`` actually delivers to a caller.
+
+    PowerShell enumerates a function's return value. A 0-element collection
+    delivers nothing at all; a 1-element collection delivers the bare element.
+    This single behaviour is the whole bug.
+    """
+    if isinstance(value, list):
+        if len(value) == 0:
+            return NOTHING
+        if len(value) == 1:
+            return value[0]
+    return value
+
+
+def ps_write_output_no_enumerate(value: object) -> object:
+    """Model of ``Write-Output -NoEnumerate``: the collection crosses whole."""
+    return value
+
+
+def ps_count(value: object) -> int:
+    """Model of ``.Count`` under ``Set-StrictMode -Version Latest``.
+
+    A real collection has Count. A scalar object does not, and reading it raises
+    the exact error the administrator saw.
+    """
+    if isinstance(value, list):
+        return len(value)
+    raise AttributeError("The property 'Count' cannot be found on this object.")
+
+
+def broken_get_as_array(value: object) -> object:
+    """The original normaliser: ``return @($Value)``. Defeated by the pipeline."""
+    if value is None:
+        return ps_pipeline_return([])
+    return ps_pipeline_return(ps_array_subexpression(value))
+
+
+def fixed_get_as_array(value: object) -> object:
+    """The corrected normaliser: ``Write-Output -NoEnumerate @($Value)``."""
+    if value is None:
+        return ps_write_output_no_enumerate([])
+    return ps_write_output_no_enumerate(ps_array_subexpression(value))
+
+
+def call_site(value: object) -> object:
+    """The corrected call-site pattern: ``@(Get-AsArray -Value $x)``."""
+    return ps_array_subexpression(fixed_get_as_array(value))
+
+
+# --- The model is able to detect the bug -----------------------------------
+
+
+def test_the_model_reproduces_the_administrator_failure() -> None:
+    """A model that could not fail would prove nothing about the fix.
+
+    The failure had two adjacent effects in the one-policy case, and which of
+    them raised the reported error cannot be determined from here. Both are
+    defects and both are fixed, so the distinction does not change the repair:
+
+      * The outer one-element list of policies was unwrapped to the inner
+        ``[PolicyName, PolicyArn]`` row. The loop then iterated over *fields*
+        rather than over policies -- a silently wrong answer, not a crash.
+      * Normalising one of those fields returned a bare string, and reading
+        ``.Count`` from a scalar is what produces "The property 'Count' cannot
+        be found on this object."
+    """
+    one_policy = [["AWSLambdaBasicExecutionRole", "arn-placeholder"]]
+
+    delivered = broken_get_as_array(one_policy)
+
+    # The outer list is gone: what arrives is the inner row.
+    assert delivered == ["AWSLambdaBasicExecutionRole", "arn-placeholder"]
+    assert ps_count(delivered) == 2, "iterating this yields fields, not policies"
+
+    # Normalising a single field then delivers a bare scalar, which has no Count.
+    field = broken_get_as_array(delivered[0])
+    assert not isinstance(field, list)
+    with pytest.raises(AttributeError, match="'Count' cannot be found"):
+        ps_count(field)
+
+
+def test_the_model_reproduces_the_scalar_case_directly() -> None:
+    """The simplest form of the same defect: a one-element list of a scalar,
+    which is exactly the shape of a single inline policy name."""
+    delivered = broken_get_as_array(["GracefulGutAI-ReadApiKeySecret"])
+
+    assert not isinstance(delivered, list)
+    with pytest.raises(AttributeError, match="'Count' cannot be found"):
+        ps_count(delivered)
+
+
+def test_the_model_reproduces_the_zero_item_failure() -> None:
+    """The zero-policy path was broken the same way and would have failed
+    identically -- an empty return arrives as nothing, not as an empty array."""
+    delivered = broken_get_as_array(None)
+
+    assert isinstance(delivered, _Nothing)
+    with pytest.raises(AttributeError, match="'Count' cannot be found"):
+        ps_count(delivered)
+
+
+def test_wrapping_the_call_site_alone_cannot_fix_the_null_case() -> None:
+    """Why the $null branch lives inside the normaliser: @($null) has a Count of
+    one, so a call-site wrap would turn "no policies" into "one null policy"."""
+    assert ps_count(ps_array_subexpression(None)) == 1
+
+
+# --- The fixed pattern handles zero, one, and many -------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "value", "expected"),
+    [
+        ("zero", None, 0),
+        ("one", [["AWSLambdaBasicExecutionRole", "arn-placeholder"]], 1),
+        (
+            "many",
+            [["PolicyA", "arn-a"], ["PolicyB", "arn-b"], ["PolicyC", "arn-c"]],
+            3,
+        ),
+    ],
+)
+def test_attached_policies_normalise_for_zero_one_and_many(
+    label: str, value: object, expected: int
+) -> None:
+    assert ps_count(call_site(value)) == expected, f"attached policies: {label}"
+
+
+@pytest.mark.parametrize(
+    ("label", "value", "expected"),
+    [
+        ("zero", None, 0),
+        ("one", ["GracefulGutAI-ReadApiKeySecret"], 1),
+        ("many", ["GracefulGutAI-ReadApiKeySecret", "SomethingElse"], 2),
+    ],
+)
+def test_inline_policies_normalise_for_zero_one_and_many(
+    label: str, value: object, expected: int
+) -> None:
+    assert ps_count(call_site(value)) == expected, f"inline policies: {label}"
+
+
+@pytest.mark.parametrize(
+    ("label", "value", "expected"),
+    [
+        ("zero", None, 0),
+        ("one", {"Effect": "Allow", "Action": "logs:PutLogEvents"}, 1),
+        (
+            "many",
+            [
+                {"Effect": "Allow", "Action": "logs:PutLogEvents"},
+                {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue"},
+            ],
+            2,
+        ),
+    ],
+)
+def test_statements_normalise_for_zero_one_and_many(
+    label: str, value: object, expected: int
+) -> None:
+    """A single-statement policy is the common shape for the inline secret grant,
+    and it is the shape that would be skipped entirely by unnormalised code."""
+    assert ps_count(call_site(value)) == expected, f"statements: {label}"
+
+
+@pytest.mark.parametrize(
+    ("label", "value", "expected"),
+    [
+        ("scalar string", "secretsmanager:GetSecretValue", 1),
+        (
+            "array",
+            ["logs:CreateLogStream", "logs:PutLogEvents"],
+            2,
+        ),
+    ],
+)
+def test_action_normalises_as_scalar_and_as_array(
+    label: str, value: object, expected: int
+) -> None:
+    assert ps_count(call_site(value)) == expected, f"Action as {label}"
+
+
+@pytest.mark.parametrize(
+    ("label", "value", "expected"),
+    [
+        ("scalar string", "*", 1),
+        ("array", ["arn-a", "arn-b"], 2),
+    ],
+)
+def test_resource_normalises_as_scalar_and_as_array(
+    label: str, value: object, expected: int
+) -> None:
+    assert ps_count(call_site(value)) == expected, f"Resource as {label}"
+
+
+@pytest.mark.parametrize(
+    ("label", "value", "expected"),
+    [
+        ("scalar", "lambda.amazonaws.com", 1),
+        ("array", ["lambda.amazonaws.com", "edgelambda.amazonaws.com"], 2),
+    ],
+)
+def test_principal_service_normalises_as_scalar_and_as_array(
+    label: str, value: object, expected: int
+) -> None:
+    """The trust-policy check compares the service-principal count against one.
+    A scalar Service would have made that comparison unreachable."""
+    assert ps_count(call_site(value)) == expected, f"Principal.Service as {label}"
+
+
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_findings_and_corrections_count_safely_at_every_size(count: int) -> None:
+    """Findings and corrections are a real List and a @()-wrapped Where-Object
+    result respectively, so both count safely at zero, one, and many."""
+    findings = [{"Severity": "Fail", "Correction": "x"} for _ in range(count)]
+
+    assert ps_count(findings) == count
+    corrections = ps_array_subexpression([f for f in findings if f["Correction"]])
+    assert ps_count(corrections) == count
+
+
+# --- The script actually uses the fixed pattern ----------------------------
+
+
+def test_the_normaliser_uses_write_output_no_enumerate() -> None:
+    helper = AUDIT_CODE[AUDIT_CODE.index("function Get-AsArray") :]
+    helper = helper[: helper.index("function Get-CallerAccountId")]
+
+    assert "Write-Output -NoEnumerate" in helper, (
+        "the normaliser returns an array through the pipeline, which unwraps it"
+    )
+    # Read from the comment-stripped copy: the doc block quotes the defeated
+    # pattern deliberately, to explain why it cannot be used.
+    assert "return @(" not in helper, "the defeated `return @(...)` pattern is back"
+
+
+def test_the_normaliser_handles_null_before_wrapping() -> None:
+    """Order is the guard: @($null) has a Count of one, so the $null test must
+    come first."""
+    helper = AUDIT_CODE[AUDIT_CODE.index("function Get-AsArray") :]
+    helper = helper[: helper.index("function Get-CallerAccountId")]
+
+    null_branch = helper.index("$null -eq $Value")
+    wrap = helper.index("Write-Output -NoEnumerate @($Value)")
+
+    assert null_branch < wrap
+
+
+def test_every_normaliser_call_site_is_wrapped() -> None:
+    """The second, independent layer. Either layer alone fixes the one-item case,
+    so a regression has to defeat both to reach an administrator."""
+    unwrapped = []
+    for line in AUDIT_CODE.splitlines():
+        if "Get-AsArray -Value" not in line:
+            continue
+        if "@(Get-AsArray -Value" not in line:
+            unwrapped.append(line.strip())
+
+    assert not unwrapped, f"unwrapped normaliser call sites: {unwrapped}"
+
+
+def test_the_collection_returning_resolvers_are_wrapped_too() -> None:
+    """Get-AttachedPolicyDocuments and Get-InlinePolicyDocuments return a List,
+    and `return $list` is enumerated by the pipeline exactly as @() was."""
+    assert "foreach ($policy in @(Get-AttachedPolicyDocuments))" in AUDIT_CODE
+    assert "foreach ($policy in @(Get-InlinePolicyDocuments))" in AUDIT_CODE
+
+
+def test_a_single_attached_policy_is_the_documented_failure_case() -> None:
+    """Requirement: the one-policy case must be named in the script, so the next
+    reader knows which shape broke it rather than rediscovering it."""
+    assert "single attached managed policy" in AUDIT_FLAT
+    assert "The property 'Count' cannot be found on this object." in AUDIT_TEXT
+
+
+def test_strict_mode_was_not_disabled_to_solve_this() -> None:
+    """The failure was a real defect that StrictMode surfaced. Turning StrictMode
+    off would have hidden it and left the audit silently skipping policies."""
+    assert "Set-StrictMode -Version Latest" in AUDIT_CODE
+    assert "Set-StrictMode -Off" not in AUDIT_TEXT
+    assert "-Version 1" not in AUDIT_TEXT
+
+
+# --- Requirement 9: every .Count in the script is provably safe ------------
+
+#: Receivers that are safe for a reason other than an inline @() wrap. Each entry
+#: is a variable name mapped to why it is a real collection.
+COUNT_RECEIVER_EXEMPTIONS = {
+    # Declared [string[]], so PowerShell coerces even a scalar to an array.
+    "$Severities": "type-constrained [string[]] parameter",
+    # The -split operator returns [string[]]; operator assignment does not go
+    # through the pipeline, so it is never unwrapped.
+    "$parts": "assigned from the -split operator",
+}
+
+#: Assignment forms that produce a genuine collection.
+SAFE_ASSIGNMENT_PATTERNS = (
+    re.compile(r"=\s*@\("),
+    re.compile(r"=\s*New-Object\s+System\.Collections\.Generic\.List"),
+    re.compile(r"=\s*New-Object\s+System\.Collections\.ArrayList"),
+)
+
+
+def function_bodies(code: str) -> dict[str, str]:
+    """Split the executable script into ``name -> body``.
+
+    Scoping matters. ``$fields`` and ``$pair`` are each used in two different
+    functions with different types -- a normalised array in one, a plain string
+    in the other. A whole-file search for their assignments mixes the two and
+    reports a false violation, which is what the first version of this scan did.
+    """
+    bodies: dict[str, str] = {}
+    parts = re.split(r"^function\s+([A-Za-z][A-Za-z0-9-]*)", code, flags=re.MULTILINE)
+
+    # parts[0] is the top-level code before the first function.
+    bodies["<script>"] = parts[0]
+    for index in range(1, len(parts) - 1, 2):
+        bodies[parts[index]] = parts[index + 1]
+    return bodies
+
+
+FUNCTION_BODIES = function_bodies(AUDIT_CODE)
+
+COUNT_PATTERN = re.compile(r"(@\([^\n]*?\)|\$[A-Za-z_][A-Za-z0-9_:]*)\.Count")
+
+
+def count_receivers() -> list[tuple[str, str]]:
+    """Every expression that has .Count read from it, with its function name."""
+    receivers = []
+    for name, body in FUNCTION_BODIES.items():
+        for match in COUNT_PATTERN.finditer(body):
+            receivers.append((name, match.group(1)))
+    return receivers
+
+
+def test_the_function_splitter_finds_the_scripts_functions() -> None:
+    """A splitter that returned one blob would make the scoped scan below no
+    better than the unscoped one it replaced."""
+    assert "Get-AsArray" in FUNCTION_BODIES
+    assert "Get-AttachedPolicyDocuments" in FUNCTION_BODIES
+    assert "Invoke-AwsRead" in FUNCTION_BODIES
+    assert len(FUNCTION_BODIES) > 15
+
+    # The scoping this exists for: $pair is a normalised array in one function
+    # and a plain string in another.
+    assert "$pair = @(Get-AsArray" in FUNCTION_BODIES["Get-AttachedPolicyDocuments"]
+    assert '$pair = "${Service}:${Operation}"' in FUNCTION_BODIES["Invoke-AwsRead"]
+
+
+def test_the_count_receiver_scan_finds_the_known_usages() -> None:
+    """A scan that matched nothing would make the rule below vacuous."""
+    receivers = count_receivers()
+
+    assert len(receivers) >= 15, f"only found {len(receivers)} .Count usages"
+
+
+def test_every_count_receiver_is_normalised_or_a_real_collection() -> None:
+    """Requirement 9, enforced rather than asserted in prose.
+
+    For each ``.Count`` in the script the receiver must be one of:
+
+      * an inline ``@(...)`` subexpression,
+      * a variable assigned -- **in the same function** -- from ``@(...)`` or a
+        generic List, or
+      * a named exemption with a recorded reason.
+
+    A new ``.Count`` on an unvetted variable fails here. This is the check the
+    first administrator run needed and did not have.
+    """
+    unproven = []
+
+    for function_name, receiver in count_receivers():
+        if receiver.startswith("@("):
+            continue
+        if receiver in COUNT_RECEIVER_EXEMPTIONS:
+            continue
+
+        # A $script: variable is declared at the top level, not in a function.
+        scope = (
+            FUNCTION_BODIES["<script>"]
+            if receiver.startswith("$script:")
+            else FUNCTION_BODIES[function_name]
+        )
+
+        assignments = [
+            line
+            for line in scope.splitlines()
+            if re.search(r"^\s*" + re.escape(receiver) + r"\s*=[^=]", line)
+        ]
+
+        if not assignments:
+            unproven.append(f"{function_name}: {receiver} has no assignment in scope")
+            continue
+
+        for line in assignments:
+            if not any(p.search(line) for p in SAFE_ASSIGNMENT_PATTERNS):
+                unproven.append(f"{function_name}: {receiver} unsafe -> {line.strip()}")
+
+    assert not unproven, "unproven .Count receivers:\n" + "\n".join(unproven)
+
+
+def test_the_receiver_scan_rejects_an_unsafe_assignment() -> None:
+    """Proof the rule can fail. A receiver assigned from a bare function call --
+    exactly the pattern that broke -- must not be accepted as safe."""
+    unsafe = "    $rows = Get-AsArray -Value $thing"
+
+    assert not any(p.search(unsafe) for p in SAFE_ASSIGNMENT_PATTERNS)
+
+    safe = "    $rows = @(Get-AsArray -Value $thing)"
+    assert any(p.search(safe) for p in SAFE_ASSIGNMENT_PATTERNS)
+
+
+def test_every_index_access_is_guarded_by_a_count_check() -> None:
+    """Indexing an unnormalised value fails the same way .Count does. Every
+    literal index in the script must sit after a Count guard in its function."""
+    functions = re.split(r"\nfunction ", AUDIT_CODE)
+    offenders = []
+
+    for body in functions:
+        indexes = list(re.finditer(r"\$([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]", body))
+        if not indexes:
+            continue
+
+        for match in indexes:
+            name = match.group(1)
+            guard = re.search(
+                r"\$" + re.escape(name) + r"\.Count\s*-(?:lt|gt|ge|le|eq|ne)", body
+            )
+            if not guard or guard.start() > match.start():
+                offenders.append(
+                    f"${name}[{match.group(2)}] is indexed without a prior Count guard"
+                )
+
+    assert not offenders, "\n".join(offenders)
+
+
+def test_the_fail_closed_behaviour_survived_the_fix() -> None:
+    """The fix touched the data plumbing, not the safety properties. All four
+    must still hold."""
+    # Exit 1 when the audit cannot complete.
+    assert "$script:ExitCode = 1" in AUDIT_CODE
+    # No review after an incomplete audit.
+    assert "if (-not $script:StagesCompleted)" in AUDIT_CODE
+    # Never print PASS for an unfinished stage.
+    assert AUDIT_CODE.count("return 'PASS'") == 1
+    # Never apply a correction.
+    assert "An administrator applies these. This script never does." in AUDIT_TEXT

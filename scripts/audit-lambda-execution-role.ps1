@@ -595,18 +595,52 @@ function Test-HasProperty {
 function Get-AsArray {
     <#
     .SYNOPSIS
-        Normalise a field that IAM allows to be either a scalar or a list.
+        Normalise a value into a real array, and return it as one.
 
     .DESCRIPTION
-        Action, Resource, and Statement are each valid as a single value or an
-        array. Code that assumes an array skips single-value statements, which is
-        the quiet way an audit passes a policy it never looked at.
+        Two separate PowerShell behaviours have to be defeated here. The first
+        version of this function handled one of them and was broken by the other.
+
+        1. **IAM allows a scalar where a list is expected.** Action, Resource,
+           Statement, and Principal.Service are each valid as a single value or
+           as an array. Code that assumes an array silently skips single-value
+           statements, which is the quiet way an audit passes a policy it never
+           looked at.
+
+        2. **A function cannot return an array by writing `return @($x)`.** The
+           return value travels through the pipeline, which *enumerates* it: a
+           one-element array arrives at the caller as the bare element, and an
+           empty array arrives as nothing at all. So the original version of this
+           normaliser handed back a scalar whenever it was given one item, and
+           $null whenever it was given none -- precisely the two cases it existed
+           to eliminate. It defeated itself.
+
+        That is what stopped the first administrator run. The audited role has a
+        single attached managed policy, so the one-element list of policies
+        arrived as a scalar, and the next `.Count` on it failed under StrictMode
+        with "The property 'Count' cannot be found on this object." The
+        zero-policy path was broken the same way and would have failed identically.
+
+        `Write-Output -NoEnumerate` is the fix: it hands the array to the caller
+        as a single object instead of streaming its elements. It has been
+        available since PowerShell 3.0, so 5.1 and 7 behave the same.
+
+        Call sites additionally wrap the result in `@(...)`. That is deliberate
+        redundancy rather than indecision: either layer alone fixes the one-item
+        case, and an edit that drops -NoEnumerate is then caught by the test suite
+        instead of by another failed administrator run. The $null case is handled
+        here and only here, because `@($null)` is a one-element array containing
+        $null -- so wrapping at the call site cannot fix it.
     #>
     param([Parameter(Mandatory = $false)]$Value)
 
-    if ($null -eq $Value) { return @() }
-    if ($Value -is [string]) { return @($Value) }
-    return @($Value)
+    # Order matters: @($null) has a Count of 1, not 0.
+    if ($null -eq $Value) {
+        Write-Output -NoEnumerate @()
+        return
+    }
+
+    Write-Output -NoEnumerate @($Value)
 }
 
 # ---------------------------------------------------------------------------
@@ -665,7 +699,7 @@ function Get-FunctionRoleName {
         -FailureMessage "Could not read the configuration of function '$FunctionName'."
 
     $fields = ConvertFrom-AwsJson -Text $result.Output -What 'the function configuration'
-    $values = Get-AsArray -Value $fields
+    $values = @(Get-AsArray -Value $fields)
     if ($values.Count -lt 3) {
         Stop-Run -Message 'The function configuration query returned fewer fields than expected.'
     }
@@ -766,7 +800,15 @@ $($result.Output)
 "@
     }
 
-    $fields = Get-AsArray -Value (ConvertFrom-AwsJson -Text $result.Output -What 'the secret metadata')
+    $fields = @(Get-AsArray -Value (ConvertFrom-AwsJson -Text $result.Output -What 'the secret metadata'))
+
+    # Guarded before indexing, like every other index in this script. The query
+    # asks for two fields so two should arrive, but "should" is what the first
+    # run's Count failure was built on.
+    if ($fields.Count -lt 1) {
+        Stop-Run -Message 'The secret metadata query returned no fields.'
+    }
+
     $arn = [string]$fields[0]
     $kmsKeyId = ''
     if ($fields.Count -gt 1 -and $null -ne $fields[1]) { $kmsKeyId = [string]$fields[1] }
@@ -835,7 +877,7 @@ this role but none of the policy-listing actions this audit needs.
         Stop-Run -Message 'The trust policy has no Statement array.'
     }
 
-    $statements = Get-AsArray -Value $document.Statement
+    $statements = @(Get-AsArray -Value $document.Statement)
     $sawAccountPrincipal = $false
     $sawFederatedPrincipal = $false
     $sawWildcardPrincipal = $false
@@ -849,7 +891,7 @@ this role but none of the policy-listing actions this audit needs.
             if ([string]$statement.Effect -eq 'Deny') { $sawDeny = $true }
         }
 
-        foreach ($action in (Get-AsArray -Value $(
+        foreach ($action in @(Get-AsArray -Value $(
                     if (Test-HasProperty -Object $statement -Name 'Action') { $statement.Action } else { $null }))) {
             if ([string]$action -notmatch '^sts:AssumeRole$') { $sawNonAssumeAction = $true }
         }
@@ -871,7 +913,7 @@ this role but none of the policy-listing actions this audit needs.
 
         foreach ($property in $principal.PSObject.Properties) {
             $key = $property.Name
-            $values = Get-AsArray -Value $property.Value
+            $values = @(Get-AsArray -Value $property.Value)
 
             switch ($key) {
                 'Service' {
@@ -971,7 +1013,7 @@ function Get-AttachedPolicyDocuments {
         ) `
         -FailureMessage "Could not list attached policies for role '$RoleName'."
 
-    $rows = Get-AsArray -Value (ConvertFrom-AwsJson -Text $result.Output -What 'the attached policy list')
+    $rows = @(Get-AsArray -Value (ConvertFrom-AwsJson -Text $result.Output -What 'the attached policy list'))
     $policies = New-Object System.Collections.Generic.List[object]
 
     if ($rows.Count -eq 0) {
@@ -980,7 +1022,7 @@ function Get-AttachedPolicyDocuments {
     }
 
     foreach ($row in $rows) {
-        $pair = Get-AsArray -Value $row
+        $pair = @(Get-AsArray -Value $row)
         if ($pair.Count -lt 2) { continue }
 
         $policyName = [string]$pair[0]
@@ -1054,7 +1096,7 @@ function Get-InlinePolicyDocuments {
         ) `
         -FailureMessage "Could not list inline policies for role '$RoleName'."
 
-    $names = Get-AsArray -Value (ConvertFrom-AwsJson -Text $result.Output -What 'the inline policy list')
+    $names = @(Get-AsArray -Value (ConvertFrom-AwsJson -Text $result.Output -What 'the inline policy list'))
     $policies = New-Object System.Collections.Generic.List[object]
 
     if ($names.Count -eq 0) {
@@ -1159,7 +1201,7 @@ function Get-ResourceScope {
     #>
     param([Parameter(Mandatory = $false)]$Resource)
 
-    $values = Get-AsArray -Value $Resource
+    $values = @(Get-AsArray -Value $Resource)
     if ($values.Count -eq 0) { return 'unspecified' }
 
     $anyWildcard = $false
@@ -1216,7 +1258,7 @@ function Test-PolicyStatements {
             continue
         }
 
-        foreach ($statement in (Get-AsArray -Value $document.Statement)) {
+        foreach ($statement in @(Get-AsArray -Value $document.Statement)) {
             $statementCount++
 
             $effect = 'Allow'
@@ -1256,8 +1298,8 @@ function Test-PolicyStatements {
             $scope = Get-ResourceScope -Resource $(
                 if (Test-HasProperty -Object $statement -Name 'Resource') { $statement.Resource } else { $null })
 
-            $actions = Get-AsArray -Value $(
-                if (Test-HasProperty -Object $statement -Name 'Action') { $statement.Action } else { $null })
+            $actions = @(Get-AsArray -Value $(
+                if (Test-HasProperty -Object $statement -Name 'Action') { $statement.Action } else { $null }))
 
             if ($actions.Count -eq 0) {
                 Add-Finding -Severity 'Review' -Title 'Allow statement grants no action' -Where $label
@@ -1682,8 +1724,8 @@ try {
     $trust = Test-TrustPolicy
 
     $policies = New-Object System.Collections.Generic.List[object]
-    foreach ($policy in (Get-AttachedPolicyDocuments)) { $policies.Add($policy) }
-    foreach ($policy in (Get-InlinePolicyDocuments)) { $policies.Add($policy) }
+    foreach ($policy in @(Get-AttachedPolicyDocuments)) { $policies.Add($policy) }
+    foreach ($policy in @(Get-InlinePolicyDocuments)) { $policies.Add($policy) }
 
     $permissions = Test-PolicyStatements -Policies $policies -Secret $secret
 
