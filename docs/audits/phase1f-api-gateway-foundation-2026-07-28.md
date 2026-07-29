@@ -22,7 +22,8 @@ sections are preserved as an audit trail rather than rewritten:
 | --- | --- |
 | 2026-07-28 | The original build of the template, runbook, and static tests |
 | Update — 2026-07-29 | The **blocked** first administrator attempt and the workflow correction that followed it. Retained in full: the failure is why the corrected workflow exists |
-| Update — 2026-07-29 (later) | The **successful** administrator validation on the corrected workflow — this update |
+| Update — 2026-07-29 (later) | The **successful** administrator validation on the corrected workflow |
+| Update — 2026-07-29 (final) | Documentation finalised and owner decisions **F1–F4 approved** — this update |
 
 Where a superseded claim appears in an earlier section it is marked in place and
 pointed forward, never deleted.
@@ -363,6 +364,10 @@ decided here. Phase 1F adds four that follow directly from building the stack:
 
 | # | Decision | Recommendation |
 | --- | --- | --- |
+> **All four were approved on 2026-07-29.** The recommendations below are what
+> was put to the owner; the approved wording — which narrows F1 and F2 rather than
+> adopting them verbatim — is in the final update at the end of this report.
+
 | **F1** | **Are WAF sampled requests acceptable**, given ~3 hours of IP retention that cannot be redacted? | **Yes, keep them.** They are the only way to review a count-mode rollout. This refines open decision 4, which previously treated WAF logging and sampling together |
 | **F2** | **What is the effective chat-route rate limit**, now that WAF cannot go below 100 per window? | Per-method API Gateway throttling at 1–2 rps as the primary control, with the WAF rule at the 100 floor as a backstop |
 | **F3** | **What stage name and what stack name** should the first deployment use? | `dev` and a `graceful-gut-ai-dev-infrastructure`-style name; one stage per stack |
@@ -907,10 +912,10 @@ stack:
 
 | Decision | Status |
 | --- | --- |
-| **F1** WAF sampled requests acceptable? | Open |
-| **F2** Effective chat-route rate limit, given the 100-per-window floor | Open |
-| **F3** Stage name and stack name for the first deployment | **Partly answered by use** — the dry run ran with `StageName=dev`. Confirm it, and confirm the stack name, rather than letting the dry run's choice become the decision by default |
-| **F4** Who executes the change sets | **Answered in practice** — the administrator ran the dry run. Confirm the same person owns execution |
+| **F1** WAF sampled requests acceptable? | ~~Open~~ → **APPROVED 2026-07-29**, scoped. See the final update |
+| **F2** Effective chat-route rate limit, given the 100-per-window floor | ~~Open~~ → **APPROVED 2026-07-29**. See the final update |
+| **F3** Stage name and stack name for the first deployment | ~~Partly answered by use~~ → **APPROVED 2026-07-29**, and confirmed explicitly rather than inherited from the dry run's choice |
+| **F4** Who executes the change sets | ~~Answered in practice~~ → **APPROVED 2026-07-29**. AJ is named |
 | The twelve Phase 1E open decisions | Open |
 | **L1** legal and compliance | **Open — launch-blocking** |
 | **L2** model-provider data flow | **Open — launch-blocking** |
@@ -941,3 +946,297 @@ Report-only change, committed as a single report commit and pushed to
 `origin/phase1f-api-gateway-foundation`. **Nothing was merged to `main`.**
 Nothing was deployed. This session made no AWS API call, no IAM change, and no
 Secrets Manager access.
+
+---
+---
+
+# Update — 2026-07-29 (final): documentation finalised, owner decisions F1–F4 approved
+
+**Outcome:** `SUCCESS` — documentation, decision record, and tests.
+**Branch:** `phase1f-api-gateway-foundation`.
+
+Two things closed in this session. The runbook still described the API Gateway
+CloudWatch prerequisite as unsatisfied and the administrator dry run as only
+blocked — stale since the successful run earlier the same day. And **F1 through
+F4 were approved by the owner**, so they are now recorded as decisions rather
+than as questions.
+
+Repository work only. **No AWS API call of any kind was made** — not
+`sts get-caller-identity`, not a `describe`, not a `get`. No deployment, no IAM
+change, no Secrets Manager access, no merge to `main`.
+
+## The approved owner decisions, as approved
+
+Recorded verbatim in `infrastructure/phase1f/administrator-runbook.md` section
+0b, which is the document an administrator actually reads before deploying.
+
+### F1 — WAF sampled requests
+
+> **Approved for private dev and count-mode validation using synthetic traffic.
+> Re-evaluate before accepting real public health questions.**
+
+This is **narrower than the recommendation** that was put forward, and the
+narrowing is the substance. The Phase 1F recommendation was "yes, keep them";
+what was approved is bounded by traffic type. The ~3 hours of unredactable IP
+retention now applies to requests the administrator generates, not to a member of
+the public describing a symptom — which is what made the trade-off cheap enough to
+accept. The approval does not carry forward: it expires when real questions
+arrive, and condition 9 of runbook section 6 now enforces a fresh decision before
+the education route accepts public traffic.
+
+WAF **logging** remains **off** and unapproved. Unlike access logs it cannot omit
+the client IP at all, so it was never part of this decision.
+
+### F2 — rate limiting
+
+| Control | Approved | Template parameter | Shipped default |
+| --- | --- | --- | --- |
+| Education route throttle, steady | **1 request per second** | `EducationRouteRateLimit` | `1` ✓ |
+| Education route throttle, burst | **2** | `EducationRouteBurstLimit` | `2` ✓ |
+| WAF rate-based rule, education route | **100** / 5 min, as a broader backstop | `WafEducationRouteRateLimit` | `100` ✓ |
+| WAF rate-rule action while the route is off | **`Count` acceptable** | `WafRateRuleAction` | `Count` ✓ |
+
+**`WafRateRuleAction` must be `Block` before public education traffic is
+enabled.** `Count` is licensed only while `EnableEducationRoute=false`, and that
+is a release condition rather than a preference: a rate rule in `Count` protects
+nothing, and the education route is the only one that costs model spend.
+
+Per-method API Gateway throttling at 1 rps / burst 2 is the **primary** control;
+the WAF rule at 100 is a **backstop**, and 100 is the AWS floor rather than a
+chosen number. This supersedes the Phase 1E proposal of 40 and 60 requests per
+five minutes, which AWS will not accept.
+
+### F3 — names for the first deployment
+
+| Item | Approved |
+| --- | --- |
+| `StageName` | **`dev`** |
+| Stack name | **`graceful-gut-ai-dev-infrastructure`** |
+
+### F4 — who executes change sets
+
+**AJ is the named administrator** responsible for reviewing and executing
+infrastructure change sets, from the Windows administrator session. Not this
+host and not any Claude session: `GracefulGutAI-ClaudeDevRole` holds none of the
+required actions, by design.
+
+## Three of the four ratify what the repository already shipped
+
+Worth stating plainly, because it changes what remains to be done: **F2 and F3
+approved values that were already the defaults in the tracked template and
+script.** F4 confirms the split the runbook was already written around.
+
+| Decision | Required a change? |
+| --- | --- |
+| F1 | **No code change.** It scopes an operational practice and adds release condition 9 |
+| F2 | **No template change** — `EducationRouteRateLimit=1`, `EducationRouteBurstLimit=2`, `WafEducationRouteRateLimit=100`, `WafRateRuleAction=Count` were already the defaults |
+| F3 | **No script change** — `admin-dry-run.ps1` already defaults `StackName` to the approved name, and the dry run ran with `StageName=dev` |
+| F4 | **No change** — the runbook was already written for a named administrator |
+
+So no infrastructure artefact was modified to satisfy these decisions. That is a
+good outcome rather than a suspicious one — the dry run had already executed with
+these exact values, so approving them ratifies a configuration that has been
+validated by CloudFormation rather than one that has only been argued for.
+
+The corresponding risk is now **drift**: a default could move and silently
+falsify the decision record. Four tests pin the approved values against the
+template and script, so a drifting default fails the suite instead of quietly
+contradicting this report.
+
+## What was corrected in the documentation
+
+### `infrastructure/phase1f/administrator-runbook.md`
+
+| Change | Why |
+| --- | --- |
+| New **current-status** section: the dry run `COMPLETED SUCCESSFULLY` on 2026-07-29, with the eleven `Add` actions, the three asserted parameters, the unexecuted and removed change set, the removed `REVIEW_IN_PROGRESS` record, and no stack remaining | The document opened by declaring the dry run incomplete. That was the first thing an administrator read, and it was wrong |
+| The current status is placed **before** the blocked attempt | A reader who stops after the first status heading must land on the current one. A test asserts the ordering |
+| Prerequisite 2 recorded as **satisfied 2026-07-29**, with the role name, its single trust principal, its single attached managed policy, and the verified `us-east-2` account value | These are the facts an administrator would otherwise re-derive from the account, and an auditor would ask for |
+| The **IAM propagation retries** recorded explicitly | The most misleading failure in the procedure. A correctly created role's first account-level `PATCH` can fail on propagation, and the natural conclusion — a bad trust policy — is wrong. A hand-run version would stop there |
+| Prerequisite check kept **mandatory before every create and every update** | Satisfied is not retired. It is a region-wide singleton living outside this stack, anything in the account can clear or repoint it, and the failure mode is silent: the stage is configured for logging and never writes any |
+| The blocked first attempt preserved, marked **superseded history** | It is the reason the scripted workflow exists. Deleting it would delete the rationale |
+| Two now-false sentences inside that history corrected in place, not removed | "The template has still never been checked" and prerequisite 2 "was not satisfied" both became false. Each now carries a **Resolved 2026-07-29** marker beside the original claim |
+| New **section 0b** recording F1–F4, and a closing note that they decide nothing about launch | The decisions belong where the change set is reviewed, not only in an audit report |
+| Section 6 release conditions extended to **ten**, adding the F1 sampling re-evaluation and explicit public launch approval | Approving four infrastructure decisions is the most likely thing to be misread as approval to launch |
+
+### `docs/architecture/phase1e-api-gateway-adr.md`
+
+| Change | Why |
+| --- | --- |
+| The chat-route rate-limit rows of §3 marked **superseded by F2**, struck through rather than deleted, with the approved arrangement stated beside them | The ADR proposed 40 and 60 per five minutes. AWS will not accept a rate-based limit below 100, so the rows cannot stand — but deleting them hides the correction |
+| §7's sampling recommendation annotated with F1's scope | That is where the sampling default lives |
+| New **Phase 1F owner decisions** block in §15, plus F1 and F2 recorded against open decisions 4 and 2 | Those two rows were the open questions F1 and F2 partly answer. Leaving them unmarked would leave the ADR contradicting the runbook |
+| An explicit statement that **none of the four is a launch approval** | Same reason as the runbook change |
+
+Neither `template.yaml` nor either PowerShell script was modified. No
+application code was modified: `backend/app/` is untouched and `CodeSha256` is
+unaffected.
+
+## Two pinned test assertions were changed deliberately
+
+Both tests were correct when written and became wrong when the dry run succeeded.
+They were changed rather than worked around, and the reason is recorded in each
+docstring — a test that pins a sentence the documentation must no longer contain
+would force the documentation to lie.
+
+| Test | Assertion | Why it had to change |
+| --- | --- | --- |
+| `test_the_runbook_records_the_blocked_first_attempt` | `"no change set has ever existed"` | **Stopped being true.** The corrected dry run created a change set, reviewed it, and removed it. The load-bearing claim — `no infrastructure has been created` — is still asserted, because it is still true |
+| `test_the_runbook_does_not_claim_the_dry_run_passed` → `test_the_runbook_does_not_overclaim_what_the_dry_run_established` | Forbade `"dry run succeeded"`; required `"that check has not been performed"` | **Inverted, not deleted.** The risk it guarded — prose read as evidence of validation that never happened — is gone, because the validation happened. The live risk is the opposite: a validated template read as a *deployed* one. The test now requires the success to be recorded and forbids nine specific overclaims, including `the stack exists`, `infrastructure has been deployed`, and `launch approved` |
+
+Nothing else in the existing suite needed changing. The other 333 tests passed
+untouched, including every guard over the two PowerShell scripts.
+
+## Tests added
+
+66 new guards in `backend/tests/test_phase1f_owner_decisions.py`, covering
+exactly the seven things this task was asked to lock in:
+
+| Area | Guards |
+| --- | --- |
+| Prerequisite recorded as satisfied | The 2026-07-29 date, the role name, its single trust principal, its single managed policy, the verified account value, that plan mode changed nothing, and the IAM propagation retries |
+| Prerequisite still verified before deployment | "before every create and before every update", "That is not a reason to stop checking it", the `get-account` command still present, and the dry-run script still enforcing it — documentation is not enforcement |
+| Blocked attempt present as history | The heading, the superseded marker, the rationale for keeping it, and the two failure modes it teaches |
+| Successful attempt is the current status | The status heading, `COMPLETED SUCCESSFULLY on 2026-07-29`, each dry-run outcome, the three parameter values, and **ordering** — current status must precede the superseded history |
+| F1–F4 recorded exactly | A section per decision; F1's synthetic-traffic scope and re-evaluation clause; F2's 1 rps, burst, 100 backstop, and conditional `Count`; F3's stage and stack name; F4 naming AJ — plus a guard that all four reach the runbook, the ADR, **and** this report |
+| `Block` required before public traffic | The requirement sentence, the narrow `Count` licence and its boundary, the template's `Count` default, and every release condition in section 6 surviving — L1, L2, `X-GG-Key`, boundary enforcement, `Block`, and launch approval |
+| Redaction | No account ID, account-bearing ARN, API ID, production origin, or credential marker in any of the five tracked files, and no value beside a secret env-var name |
+| Drift | F2's four approved values pinned against `template.yaml`; F3's stack name pinned against `admin-dry-run.ps1` |
+
+Five of the new tests failed on first run. Three were my own defects and were
+fixed rather than relaxed:
+
+| Failure | Cause | Fix |
+| --- | --- | --- |
+| Two phrase assertions against the ADR and runbook | `normalise` collapsed whitespace but left Markdown **blockquote markers**, so a `> ` from each wrapped line survived into the middle of the flattened phrase. Phrases that read correctly in the document could not match | Strip blockquote markers before collapsing whitespace |
+| One assertion compared a capitalised needle against a lowercased haystack | Straightforward test bug | Lowercase the needle |
+| API-ID detector flagged `template.yaml` and this report | The pattern matched any **ten-letter English word** after the phrase "API ID" — `substitute` and `production` both qualify | Require the candidate to carry both a digit and a letter, with the heuristic's limits documented and the two false positives pinned as self-tests |
+| Production-origin detector flagged `template.yaml` | It read the CloudFormation `Sub` expression `https://${RestApi}.execute-api.${AWS::Region}...` as a hostname | Allow `${` interpolation, as with the `<placeholder>` convention |
+
+The detector self-test now proves each pattern catches a planted account ID, ARN,
+and API ID, **and** that it does not catch the two prose phrases that defeated
+it. A scanner that silently matches nothing protects nothing; a scanner that
+matches ordinary prose gets switched off, which is the same failure by a
+different route.
+
+## Verification results — 2026-07-29 (final)
+
+| Gate | Result |
+| --- | --- |
+| `.venv/bin/python -m pytest -q` | **PASS** — 401 passed, 0 failed, 0 skipped (335 before this session, 66 added) |
+| `backend/tests/test_phase1f_owner_decisions.py` alone | **PASS** — 66 passed |
+| `.venv/bin/ruff check backend/` | **PASS** — all checks passed |
+| `.venv/bin/ruff format backend/` | 1 file reformatted |
+| `.venv/bin/ruff format --check backend/` | **PASS** — 17 files already formatted |
+| `git diff --check` | **PASS** — no whitespace errors |
+| AWS calls made by this session | **Zero** |
+| Deployment | **Not performed** |
+
+Python 3.13 coverage is CI's, not the local venv's, as `CLAUDE.md` records.
+
+## Files — 2026-07-29 (final)
+
+### Added
+
+| File | Contents |
+| --- | --- |
+| `backend/tests/test_phase1f_owner_decisions.py` | 66 guards over the satisfied prerequisite, the preserved history, F1–F4, the `Block` release condition, and redaction |
+
+### Modified
+
+| File | Change |
+| --- | --- |
+| `infrastructure/phase1f/administrator-runbook.md` | Current-status section, satisfied prerequisite with the retry note, preserved and marked history, section 0b recording F1–F4, ten release conditions |
+| `docs/architecture/phase1e-api-gateway-adr.md` | F2 supersedes the chat-route rate limits; F1 annotates the sampling default; F1–F4 recorded in §15 against decisions 2 and 4 |
+| `backend/tests/test_phase1f_admin_workflow.py` | Two pinned assertions changed deliberately, with the reason in each docstring |
+| `docs/audits/phase1f-api-gateway-foundation-2026-07-28.md` | This update, the header, and forward pointers on the two superseded decision tables |
+
+### Deleted
+
+None.
+
+## AWS resources created, read, modified, or deleted — 2026-07-29 (final)
+
+**None. Zero AWS API calls were made in this session.**
+
+The three AWS changes recorded in this report remain the administrator's, from
+the earlier logging prerequisite: one IAM role created, one approved AWS-managed
+policy attached, and the regional API Gateway account `cloudwatchRoleArn`
+modified. Nothing in this session added to that list, and the CloudFormation dry
+run itself still leaves no stack and no template resource.
+
+## Security and privacy checks — 2026-07-29 (final)
+
+| Check | Result |
+| --- | --- |
+| No credential, token, or secret value in any changed file | **PASS** — enforced by test across five tracked files |
+| No account ID or account-bearing ARN | **PASS** — enforced by test. One IAM role **name** and one AWS-managed policy **name** appear; neither carries an account field |
+| No API ID | **PASS** — enforced by test, with the detector's heuristic documented |
+| No production origin | **PASS** — enforced by test; `ProductionOrigin` remains a runtime parameter with no default, and the value the administrator supplied is not reproduced anywhere |
+| No live Function URL or private URL | **PASS** |
+| Stack name committed | **Deliberate.** F3 approved `graceful-gut-ai-dev-infrastructure`; a stack name is an identifier, not a credential, and the repository already records the function name |
+| No PHI, health text, or personal identifying information | **PASS** |
+| Secrets Manager accessed | **No** |
+| IAM modified | **No** |
+| Public free-text input still disabled | **PASS** — `EnableEducationRoute` default `false`, unchanged, and now guarded by a test that the release conditions survive |
+| Merged to `main` | **No** |
+
+## Findings and blockers — 2026-07-29 (final)
+
+Approving F1–F4 resolved **no** blocker. Nothing here is newly closed.
+
+| # | Item | Status |
+| --- | --- | --- |
+| **L1** | Legal and compliance determination | **OPEN — launch-blocking** |
+| **L2** | Model-provider data-flow determination | **OPEN — launch-blocking** |
+| **3** | Browser authentication / the `X-GG-Key` replacement | **OPEN — launch-blocking.** Still one static shared secret, still listed in the application's CORS allowed headers, still safe only while every configured origin is loopback |
+| **4** | Application boundary enforcement in the request path | **OPEN — launch-blocking.** Still enforced in prompt text and documentation, not on every response |
+| **5** | Public production launch approval | **OPEN — not given.** The `CLAUDE.md` release gate is unsatisfied: API Gateway is validated but **not applied**, and the raw Function URL is still the entry point |
+| **6** | `GracefulGutAI-LambdaExecutionRole` audit | **OPEN.** Carried from Phase 1D and 1E. An earlier update recommended closing it while administrator credentials were available; that recommendation stands and the audit has **not** been done |
+| **1** | WAF rate rules ship in `Count` | **Open, now bounded.** F2 licenses `Count` only while the route is off and requires `Block` before public traffic |
+| **2** | WAF cannot express the ADR's chat-route rate limits | **Closed as a decision, permanent as a constraint.** F2 settles what to do about the 100-per-window floor; the floor itself is an AWS fact |
+| **4′** | Redeployment is a manual step | **Open.** `AWS::ApiGateway::Deployment` is immutable; a stack update can succeed while callers still see old routes |
+| **D** | PowerShell is not syntax-checked in CI | **Open.** Both scripts have now run successfully on Windows, which is stronger evidence than a linter but is still one run on one machine |
+
+## Decisions required from AJ or Jenna — 2026-07-29 (final)
+
+**F1–F4 are decided and no new infrastructure decision is raised.** What remains
+is not a preference queue:
+
+| Item | What closing it actually requires |
+| --- | --- |
+| **L1** legal and compliance | An external determination — not a selection between options. Launch-blocking |
+| **L2** model-provider data flow | A review of what leaves the account, to whom, and under what terms, including whether a BAA is needed and available. Launch-blocking |
+| `X-GG-Key` replacement | An authentication decision: API Gateway keys with usage plans, a signed short-lived token, or `AuthType: AWS_IAM` — then implemented |
+| Boundary enforcement | Phase 2 application work, not started |
+| The twelve Phase 1E open decisions | Unchanged, except 2 and 4, now partly answered by F2 and F1 |
+| Public launch approval | Downstream of all of the above |
+
+The `LambdaExecutionRole` audit needs administrator credentials rather than a
+decision, and is the cheapest item on this list.
+
+## Recommended next step
+
+1. **Execute the CREATE change set** for the `dev` stage with the education route
+   off, as `graceful-gut-ai-dev-infrastructure`, per F3 and F4. Everything
+   required to do this safely is now decided, validated, and documented: the
+   template passed CloudFormation, the eleven resources are pinned, the
+   prerequisite is satisfied, and the runbook's review checklist and rollback are
+   written. It is reversible.
+2. **Re-verify prerequisite 2 first**, as section 0 now requires. It is one
+   read-only call and the failure it prevents is silent.
+3. **Audit `GracefulGutAI-LambdaExecutionRole`** while administrator credentials
+   are to hand. Carried since Phase 1D for want of credentials only.
+4. **Do not enable the education route.** Runbook section 6 lists ten prior
+   conditions and F1–F4 satisfied none of them. L1, L2, the `X-GG-Key`
+   replacement, boundary enforcement, the F1 sampling re-evaluation, and explicit
+   launch approval are all still required.
+5. Optionally add PowerShell parsing to CI (finding **D**) if the Windows helper
+   set grows further.
+
+## Push — 2026-07-29 (final)
+
+Documentation and tests committed separately from this report, per the reporting
+protocol. Both commits pushed to `origin/phase1f-api-gateway-foundation`.
+**Nothing was merged to `main`.** Nothing was deployed. No AWS API call, no IAM
+change, and no Secrets Manager access.
