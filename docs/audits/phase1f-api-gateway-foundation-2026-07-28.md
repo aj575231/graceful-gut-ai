@@ -1,13 +1,21 @@
 # Phase 1F — API Gateway infrastructure foundation
 
-**Date:** 2026-07-28
-**Outcome:** `SUCCESS`
+**Date:** 2026-07-28, updated 2026-07-29
+**Outcome:** `SUCCESS` — for the repository work in both sessions
+**Administrator dry run:** `BLOCKED` — attempted 2026-07-29, produced no AWS
+resources. See "Update — 2026-07-29" below.
 **Branch:** `phase1f-api-gateway-foundation`
 
 This report is redacted by construction. No account ID, instance ID, full ARN,
 API ID, live Function URL, production domain, secret identifier, credential, or
 secret value appears anywhere in it. Git commit SHAs are not secrets and are
 recorded deliberately.
+
+This report is **updated in place** rather than duplicated, per the reporting
+protocol. The 2026-07-28 sections below record the original build and are
+unchanged except where a specific claim was corrected; the 2026-07-29 update at
+the end records the blocked administrator attempt and the workflow correction
+that followed it.
 
 ---
 
@@ -378,6 +386,10 @@ nothing, and it is the cheapest way to find a template error before it matters.
 The account-level API Gateway CloudWatch role (runbook prerequisite 2) is the
 most likely first-attempt failure and is worth confirming before the dry run.
 
+> **2026-07-29:** that prediction was correct, and the dry run was attempted and
+> blocked on exactly that prerequisite. See the update below. The recommended
+> next step is now the one at the end of this report.
+
 ---
 
 ## Push
@@ -389,3 +401,205 @@ task.
 
 Nothing was merged to `main`. Nothing was deployed. No AWS resource was created,
 read, updated, or deleted.
+
+---
+---
+
+# Update — 2026-07-29: blocked administrator dry run, workflow corrected
+
+**Outcome of this session's work:** `SUCCESS` — repository only.
+**Outcome of the administrator dry run it responds to:** `BLOCKED`.
+
+## What the administrator attempt actually did
+
+The dry run recommended above was attempted on Windows by pasting the runbook's
+commands into a console. It did not complete. Recorded exactly:
+
+| # | What happened |
+| --- | --- |
+| 1 | `aws apigateway get-account` returned **no `cloudwatchRoleArn`** — runbook prerequisite 2 was not satisfied in the region |
+| 2 | The prerequisite check **correctly raised an error** — and the remaining commands were pasted and executed separately anyway |
+| 3 | The generated parameter file URI was `file:///C:/Users/...` |
+| 4 | The AWS CLI **rejected it as an invalid Windows path** |
+| 5 | **`create-change-set` never succeeded.** No CloudFormation stack and no change set ever existed |
+| 6 | The later validation and deletion calls failed **because the stack did not exist**, not for any reason to do with the template |
+| 7 | The pasted commands nevertheless **wrote a review file recording `PASS`** and printed **unconditional cleanup success messages** |
+| 8 | **No CloudFormation resources were created or modified.** None |
+
+The invalid `PASS` review from that attempt was deleted. It is not in this
+repository, was never committed, and must not be treated as evidence of
+anything. **The template has still never been checked against real
+CloudFormation.**
+
+Item 7 is the one that mattered most. A dry run that fails loudly costs an
+afternoon. A dry run that fails and files a passing review is read months later
+as proof the template was validated, and the cost lands then.
+
+## What this session changed
+
+Repository work only. **No AWS API call of any kind was made in this session**
+— not `sts get-caller-identity`, not a `describe`, not a `get`. The two new
+scripts were **written, not executed**: both require administrator credentials
+this host does not hold and must never hold, so their behaviour is pinned by
+static tests rather than by running them.
+
+### Added
+
+| File | Contents |
+| --- | --- |
+| `scripts/admin-dry-run.ps1` | The whole dry run as one fail-closed script: six prerequisites, parameter file, `validate-template`, a CREATE change set, assertions, review, and cleanup of both objects it creates |
+| `scripts/setup-apigw-cloudwatch-role.ps1` | Administrator-only, one-time prerequisite helper for the account-level API Gateway CloudWatch role. Plan by default; writes only with `-Apply` |
+| `backend/tests/test_phase1f_admin_workflow.py` | 100 static guards over both scripts and the runbook |
+
+### Modified
+
+| File | Change |
+| --- | --- |
+| `infrastructure/phase1f/administrator-runbook.md` | Records the blocked attempt; names the two scripts as the preferred Windows workflow; corrects the `validate-template` claim; documents Windows parameter-file syntax and the empty `REVIEW_IN_PROGRESS` stack; prohibits continuing by hand after a failure |
+| `docs/audits/phase1f-api-gateway-foundation-2026-07-28.md` | This update |
+
+No application code was modified. `backend/app/` is untouched and `CodeSha256`
+is unaffected.
+
+## How each failure is now prevented
+
+| Failure | Correction |
+| --- | --- |
+| Continuing past a failed prerequisite | `admin-dry-run.ps1` aborts the entire run on the first failure. Failures `throw`, which unwinds into the `finally` block — there is no next command left for anyone to paste |
+| Judging a call by whether output appeared | Every AWS call returns an exit code and is checked. `Invoke-AwsOrStop` stops the run on a nonzero one |
+| The `file:///C:/` URI | `Get-CliFileArgument` returns `file://` plus the resolved native path. Tests forbid `file:///` in executable lines and forbid `AbsoluteUri` and `System.Uri` outright — those are how the bug returns |
+| Validating after a failed creation | The run stops between `create-change-set` and anything that reads the change set back. A test asserts the guard precedes the first `describe-change-set` |
+| Executing a change set | The CLI verb does not appear anywhere in the file, and a test asserts its absence across the whole text |
+| Unconditional `PASS` | The literal is produced in exactly one function, `ConvertTo-Outcome`, which takes a `[bool]`. Tests assert one occurrence in executable code and that no `Write-Host` prints the word directly |
+| Unconditional cleanup success | `ConvertTo-CleanupOutcome` takes `-Existed` and `-Removed` and distinguishes `REMOVED`, `NOT PRESENT`, and `STILL PRESENT`. Deleting something that was never there is not reported as a success |
+| A review for a run that did not finish | The review is written only after every assertion passes, and is scanned for account IDs, ARNs, URLs, and credential names before it is written — a match means no file |
+| The empty `REVIEW_IN_PROGRESS` stack | Cleanup deletes the change set **and** the stack record, then confirms absence by re-reading rather than inferring it from an exit code |
+| A parameter file left in the repository | Written under `%TEMP%`, UTF-8 without BOM, deleted in a `finally` block. The script refuses to run if `%TEMP%` resolves inside the checkout |
+
+### Prerequisites the script now enforces before anything is created
+
+Working tree clean; branch is `phase1f-api-gateway-foundation`; the AWS profile
+resolves; the application function is `Active` with `LastUpdateStatus`
+`Successful`; the account-level API Gateway CloudWatch role is configured in the
+region; and no non-deleted stack already holds the requested stack name. An
+unset `cloudwatchRoleArn` renders as the literal `None` under `--output text`,
+which is a non-empty string — the check treats `None` and `null` as unset, and a
+test pins that.
+
+### What the dry run asserts about the change set
+
+Every change is an `Add`; there are exactly **eleven**, which is the template's
+twenty resources minus the nine conditional on the education route; the logical
+IDs are exactly the reviewed set; no `AWS::Lambda::Function`, `AWS::Lambda::Url`,
+IAM, WAF-logging, or budget resource appears; and `EnableEducationRoute=false`,
+`StageName=dev`, `WafRateRuleAction=Count`. The eleven expected IDs are pinned
+against the template itself, so adding a resource without updating the dry run
+fails in the test suite rather than in front of an administrator.
+
+### The role helper
+
+Plan by default — without `-Apply` it reads the current state and reports what
+would differ. A test asserts every mutating call appears after the plan-mode
+early exit, so plan mode cannot reach one however the branches fall. In apply
+mode it creates one role trusting **only** `apigateway.amazonaws.com`, attaches
+**only** the AWS-managed `AmazonAPIGatewayPushToCloudWatchLogs` policy, sets the
+account value, and reads it back to verify. If a role of that name already
+exists with a different trust policy, extra attached policies, or inline
+policies, it **stops rather than overwriting it** — a role this procedure does
+not own may be serving something else.
+
+Account IDs and ARNs are masked out of everything both scripts print, ARNs
+before bare account IDs so no half-masked ARN survives. The AWS-managed policy
+ARN is deliberately exempt: it contains no account field, and masking it would
+hide the one detail a reviewer needs.
+
+## Verification results — 2026-07-29
+
+| Gate | Result |
+| --- | --- |
+| `.venv/bin/python -m pytest -q` | **PASS** — 335 passed, 0 failed, 0 skipped (235 before this session, 100 added) |
+| `backend/tests/test_phase1f_admin_workflow.py` alone | **PASS** — 100 passed |
+| `.venv/bin/ruff check backend/` | **PASS** — all checks passed |
+| `.venv/bin/ruff format backend/` | 1 file reformatted |
+| `.venv/bin/ruff format --check backend/` | **PASS** — 16 files already formatted |
+| `git diff --check` | **PASS** — no whitespace errors |
+| PowerShell syntax parse | **Not run** — no PowerShell interpreter on this host. The scripts are guarded by static tests and are unexecuted; a first run belongs to the administrator |
+| Either new script executed | **No** — deliberately. Both need administrator credentials this host does not hold |
+| `aws cloudformation validate-template` | **Not run** — it is an AWS API call, and this session made none |
+
+Eleven of the new tests failed on first run and were the reason for four script
+changes and one runbook rewording, rather than being relaxed to fit. Two of
+them are self-tests — the comment stripper and the "substantial script after
+stripping" check — because a text scanner that silently matches nothing protects
+nothing. That is the same reasoning behind the URL-detector and
+credential-tripwire self-tests from the original Phase 1F suite.
+
+## AWS resources created, read, modified, or deleted — 2026-07-29
+
+**None.** Zero AWS API calls were made in this session. The administrator
+attempt that this session responds to also created and modified **no**
+CloudFormation resources: no stack, no change set, no API, no WAF Web ACL, no
+log group. The only account-level fact it established is that
+`cloudwatchRoleArn` is unset in the region.
+
+## Security and privacy checks — 2026-07-29
+
+| Check | Result |
+| --- | --- |
+| No credential, token, or secret value in either script | **PASS** — enforced by test |
+| No twelve-digit account ID in either script | **PASS** — enforced by test, with detector regexes excluded so the rule stays honest |
+| No hardcoded account-bearing ARN | **PASS** — enforced by test; the AWS-managed policy ARN is the one exempt literal and carries no account field |
+| No live URL or SSO start URL in either script | **PASS** — enforced by test; only `https://example.com` and `<approved-origin>` placeholders |
+| No API ID read or recorded | **PASS** — a change set describes logical IDs; the physical ID does not exist until it is executed |
+| Production origin is a parameter, never committed | **PASS** — mandatory parameter with no default, enforced by test |
+| Completed parameter file never enters Git | **PASS** — `%TEMP%` only, refused if `%TEMP%` is inside the checkout, deleted in `finally` |
+| Review is scanned for leaks before it is written | **PASS** — fail closed: a match writes no file |
+| Terminal errors pass through the mask | **PASS** — enforced by test |
+| No IAM created or modified by this session | **PASS** — the helper was written, not run |
+| No Secrets Manager access | **PASS** — neither script contains a `secretsmanager:` call |
+| No PHI path introduced | **PASS** |
+| Public free-text input still disabled | **PASS** — unchanged; the dry run asserts `EnableEducationRoute=false` |
+
+## Blockers and unresolved findings — 2026-07-29
+
+| # | Finding | Status |
+| --- | --- | --- |
+| **A** | **The account-level API Gateway CloudWatch role is not configured in the region.** This is the original blocker and it is unresolved | Administrator action. `setup-apigw-cloudwatch-role.ps1 -Apply` does it; this host holds no IAM write and no `apigateway:PATCH` on `/account` and cannot |
+| **B** | **The template has never been validated against real CloudFormation.** Every check on it to date is static | Cleared by running `admin-dry-run.ps1` once A is done |
+| **C** | Neither new script has ever been executed | By design. First run is the administrator's, and it should be the plan-mode helper |
+| **D** | PowerShell syntax is not parsed anywhere in CI | The repository has no PowerShell linting for `pull-task-report.ps1` either. Worth adding if the Windows helper set keeps growing — see the next-step note |
+
+Findings 1–5 from the 2026-07-28 section are unchanged and still open.
+
+## Decisions required from AJ or Jenna — 2026-07-29
+
+None new. F1–F4 and the twelve Phase 1E open decisions are unchanged, and L1
+and L2 remain launch-blocking. This session corrected a workflow; it decided
+nothing about the product.
+
+One judgement call was made and is flagged rather than buried: the second script
+is named `scripts/setup-apigw-cloudwatch-role.ps1`. The task named the file
+partially; this name follows the repository's verb-noun script convention.
+Rename it if you prefer a different one — the runbook and tests reference it in
+three places.
+
+## Recommended next step
+
+1. **Administrator runs `.\scripts\setup-apigw-cloudwatch-role.ps1`** with no
+   switch first. It changes nothing and reports what it would do.
+2. **Then `-Apply`**, which resolves blocker A.
+3. **Then `.\scripts\admin-dry-run.ps1 -ProductionOrigin <approved-origin>`**,
+   which resolves blocker B and produces a review file under `%TEMP%`.
+4. Paste that review into this report. It is written to be redacted already —
+   no account ID, ARN, API ID, or URL — so it can be pasted as-is.
+
+If any step stops, **fix the reported cause and re-run the script**. Do not
+paste the individual commands to get past the step that failed. That is what
+turned a correctly-detected missing prerequisite into a review claiming PASS.
+
+## Push — 2026-07-29
+
+Implementation and report committed separately. The branch was pushed to
+`origin/phase1f-api-gateway-foundation`. **Nothing was merged to `main`.**
+Nothing was deployed. No AWS resource was created, read, updated, or deleted,
+and no IAM or Secrets Manager call was made.
