@@ -1192,7 +1192,7 @@ Approving F1–F4 resolved **no** blocker. Nothing here is newly closed.
 | **3** | Browser authentication / the `X-GG-Key` replacement | **OPEN — launch-blocking.** Still one static shared secret, still listed in the application's CORS allowed headers, still safe only while every configured origin is loopback |
 | **4** | Application boundary enforcement in the request path | **OPEN — launch-blocking.** Still enforced in prompt text and documentation, not on every response |
 | **5** | Public production launch approval | **OPEN — not given.** The `CLAUDE.md` release gate is unsatisfied: API Gateway is validated but **not applied**, and the raw Function URL is still the entry point |
-| **6** | `GracefulGutAI-LambdaExecutionRole` audit | **OPEN.** Carried from Phase 1D and 1E. An earlier update recommended closing it while administrator credentials were available; that recommendation stands and the audit has **not** been done |
+| **6** | `GracefulGutAI-LambdaExecutionRole` audit | **OPEN — tooling now exists, the audit does not.** Phase 1G built `scripts/audit-lambda-execution-role.ps1`, a read-only administrator audit of this role, with 90 static guards. It has **never been executed** — no PowerShell interpreter on this host, and the dev role cannot read the role's policies in any case. This finding closes only when AJ runs the script and supplies its review. See `docs/audits/phase1g-lambda-execution-role-audit-2026-07-29.md` |
 | **1** | WAF rate rules ship in `Count` | **Open, now bounded.** F2 licenses `Count` only while the route is off and requires `Block` before public traffic |
 | **2** | WAF cannot express the ADR's chat-route rate limits | **Closed as a decision, permanent as a constraint.** F2 settles what to do about the 100-per-window floor; the floor itself is an AWS fact |
 | **4′** | Redeployment is a manual step | **Open.** `AWS::ApiGateway::Deployment` is immutable; a stack update can succeed while callers still see old routes |
@@ -1226,7 +1226,11 @@ decision, and is the cheapest item on this list.
 2. **Re-verify prerequisite 2 first**, as section 0 now requires. It is one
    read-only call and the failure it prevents is silent.
 3. **Audit `GracefulGutAI-LambdaExecutionRole`** while administrator credentials
-   are to hand. Carried since Phase 1D for want of credentials only.
+   are to hand. Carried since Phase 1D for want of credentials only. **Phase 1G
+   has built the tooling** — run
+   `.\scripts\audit-lambda-execution-role.ps1 -ExpectedSecretName <secret-name>`.
+   It is read-only, changes nothing, and writes a redacted review under `%TEMP%`.
+   The finding stays open until that review exists.
 4. **Do not enable the education route.** Runbook section 6 lists ten prior
    conditions and F1–F4 satisfied none of them. L1, L2, the `X-GG-Key`
    replacement, boundary enforcement, the F1 sampling re-evaluation, and explicit
