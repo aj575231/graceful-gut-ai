@@ -830,27 +830,68 @@ def test_the_review_records_no_api_id() -> None:
 
 
 def test_the_runbook_records_the_blocked_first_attempt() -> None:
+    """The blocked attempt stays in the runbook as history: it is the reason the
+    scripted workflow exists. It is marked superseded so that no reader mistakes
+    it for the current state.
+
+    The assertion on ``no change set has ever existed`` was removed on
+    2026-07-29 because it stopped being true, not because it stopped mattering.
+    The corrected dry run created a change set, reviewed it, and removed it. A
+    test that pins a sentence the repository must no longer contain would force
+    the documentation to lie.
+    """
     assert "The first administrator attempt was BLOCKED" in RUNBOOK_TEXT
+    assert "superseded history" in RUNBOOK_FLAT.lower()
+    assert "Superseded on 2026-07-29" in RUNBOOK_FLAT
+
+    # No infrastructure exists. Still true, and the load-bearing claim.
     assert "no infrastructure has been created" in RUNBOOK_FLAT
-    assert "no change set has ever existed" in RUNBOOK_FLAT
+
+    # The failure modes themselves survive, or the section teaches nothing.
+    assert "The remaining commands were pasted and executed separately anyway" in (
+        RUNBOOK_FLAT
+    )
+    assert "file:///C:/" in RUNBOOK_TEXT
 
 
 def test_the_runbook_records_that_the_pass_review_was_invalid() -> None:
+    """The invalid PASS review is permanent history regardless of later success:
+    it is the failure the whole scripted workflow was built to prevent."""
     assert "That review was invalid and has been deleted" in RUNBOOK_FLAT
+    assert "It is evidence of nothing" in RUNBOOK_FLAT
 
 
-def test_the_runbook_does_not_claim_the_dry_run_passed() -> None:
-    """The specific failure being guarded against: prose that a later reader
-    takes as evidence the template was checked against real CloudFormation."""
-    for claim in (
-        "dry run passed",
-        "dry run succeeded",
-        "dry run completed successfully",
-        "change set was reviewed and deleted successfully",
+def test_the_runbook_does_not_overclaim_what_the_dry_run_established() -> None:
+    """Replaces ``test_the_runbook_does_not_claim_the_dry_run_passed``.
+
+    That test forbade the phrase "dry run succeeded" and required "that check has
+    not been performed". Both were correct while the template had never reached
+    CloudFormation, and both became wrong on 2026-07-29 when it did. The guard is
+    inverted rather than deleted: the risk is no longer a false claim of
+    validation, it is a validated template being read as a *deployed* one.
+    """
+    lowered = RUNBOOK_FLAT.lower()
+
+    # The success is recorded -- the old test forbade exactly this.
+    assert "completed successfully on 2026-07-29" in lowered
+
+    # But it must not be inflated into a deployment or a launch.
+    for overclaim in (
+        "the stack has been created",
+        "the stack was created",
+        "the stack exists",
+        "infrastructure has been deployed",
+        "infrastructure was deployed",
+        "the api is live",
+        "change set was executed",
+        "launch approved",
+        "approved for launch",
     ):
-        assert claim not in RUNBOOK_FLAT.lower(), f"the runbook claims: {claim}"
+        assert overclaim not in lowered, f"the runbook overclaims: {overclaim}"
 
-    assert "that check has not been performed" in RUNBOOK_FLAT
+    # And the distinction is stated outright.
+    assert "the dry run, not a deployment" in lowered
+    assert "never been executed" in lowered
 
 
 def test_the_runbook_names_both_scripts_as_the_preferred_workflow() -> None:

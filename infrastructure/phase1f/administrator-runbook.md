@@ -8,25 +8,62 @@ and no Function URL administration. A session that finds a setting wrong should
 **report it and stop**, not attempt a repair.
 
 Placeholders are filled in at the point of use and never committed:
-`<AWS_ACCOUNT_ID>`, `<STACK_NAME>`, `<API_ID>`, `<PARAMETERS_FILE>`,
+`<AWS_ACCOUNT_ID>`, `<API_ID>`, `<PARAMETERS_FILE>`,
 `<SQUARESPACE_PRODUCTION_ORIGIN>`.
+
+`<STACK_NAME>` is the one exception: owner decision **F3** approved
+`graceful-gut-ai-dev-infrastructure`, and a stack name is an identifier rather
+than a credential, so it is recorded in section 0b.
 
 Region is `us-east-2` throughout.
 
 ---
 
-## The first administrator attempt was BLOCKED
+## Current status — the corrected dry run SUCCEEDED
 
-**Status of the Phase 1F dry run: not completed. No CloudFormation stack and no
-change set has ever existed for this template, and no infrastructure has been
-created.**
+**Status of the Phase 1F dry run: COMPLETED SUCCESSFULLY on 2026-07-29**, driven
+end to end through the two scripts in the next section rather than by hand.
+
+| Item | Status as of 2026-07-29 |
+| --- | --- |
+| One-time API Gateway CloudWatch logging prerequisite (prerequisite 2) | **Satisfied** — see section 0 |
+| `aws cloudformation validate-template` | **Passed** |
+| CREATE change-set creation | **Passed** |
+| Change-set contents | **Exactly eleven `Add` actions**, matching the reviewed set |
+| `EnableEducationRoute` | `false` |
+| `StageName` | `dev` |
+| `WafRateRuleAction` | `Count` |
+| Change set executed? | **No — never executed** |
+| The change set afterwards | **Removed** |
+| The empty `REVIEW_IN_PROGRESS` stack record | **Removed** |
+| Stack remaining afterwards | **None** — no non-deleted stack remained |
+
+**The template is now validated against real CloudFormation, and no
+infrastructure has been created.** Both are true at once, and that is precisely
+what a dry run is for: the eleven resources were proposed, reviewed, and
+discarded. No API, no stage, no WAF Web ACL, no log group, and no Lambda
+permission exists.
+
+The procedures in sections 1 through 5 have still **never been executed**. What
+succeeded on 2026-07-29 was the dry run, not a deployment.
+
+---
+
+## The first administrator attempt was BLOCKED — superseded history
+
+> **Superseded on 2026-07-29 by the successful run recorded above.** This section
+> is kept because it is the reason the scripted workflow exists, not because it
+> describes the current state. Every blocker named in it has since been cleared.
+> Do not read it as the status of anything.
 
 The first attempt, on Windows, ran the commands in this file by hand and failed
-in four steps that are worth reading before the second attempt, because three
+in four steps that are worth reading before running anything here, because three
 of them are properties of the procedure rather than of the account:
 
 1. `aws apigateway get-account` returned no `cloudwatchRoleArn` — prerequisite 2
-   below was not satisfied. The check itself worked and raised an error.
+   below was not satisfied at that time. The check itself worked and raised an
+   error. **Resolved 2026-07-29**; the prerequisite is now satisfied, and
+   section 0 records how.
 2. **The remaining commands were pasted and executed separately anyway.** A
    failed prerequisite in a pasted sequence stops nothing; the next command is
    already on the clipboard.
@@ -35,17 +72,20 @@ of them are properties of the procedure rather than of the account:
    so `create-change-set` never succeeded.
 4. Because no change set and no stack were created, the later `describe` and
    `delete` calls failed for that reason and not for any reason to do with the
-   template. The template has still never been checked against real
-   CloudFormation.
+   template. As of that attempt, the template had still never been checked
+   against real CloudFormation. **Resolved 2026-07-29** — it has been checked
+   since, and it passed.
 
 The attempt nevertheless **wrote a review file recording PASS and printed
 cleanup success messages**, for stages that had not run and objects that had
-never existed. That review was invalid and has been deleted. Nothing in this
-repository should be read as evidence that the template has been checked
-against real CloudFormation — that check has not been performed.
+never existed. That review was invalid and has been deleted. It is evidence of
+nothing, and it must not be confused with the successful 2026-07-29 run: the
+evidence that the template validates is that run, recorded above, and not the
+deleted file.
 
 The two scripts in the next section exist so that none of steps 2 through 4 can
-happen again. **Use them instead of pasting the commands below.**
+happen again. **Use them instead of pasting the commands below.** They are what
+made the 2026-07-29 run succeed.
 
 ---
 
@@ -96,13 +136,20 @@ needs help continuing.
 
 ## 0. Prerequisites
 
-Confirm each before the first `create-change-set`. Two of them are
-account-scoped and are the usual cause of a first-attempt failure.
+**Confirm every one of these before every create and before every update — not
+only before the first one.** Two are account-scoped and are the usual cause of a
+first-attempt failure.
+
+Prerequisite 2 is currently satisfied (2026-07-29). **That is not a reason to
+stop checking it.** It is a region-wide singleton that lives outside this stack,
+so anything else in the account can clear or repoint it, and the failure it
+produces is silent: the stage is configured for logging and simply never writes
+any. The check costs one read-only API call. Keep it.
 
 | # | Prerequisite | Why |
 | --- | --- | --- |
 | 1 | The application Lambda exists and is healthy | This stack references it by ARN and never creates it |
-| 2 | An account-level API Gateway CloudWatch role is configured for the region | Access logging and execution logging silently do nothing without it. It is a **region-wide singleton** and is deliberately not declared in the template — a stack delete would clear it for every API in the region |
+| 2 | An account-level API Gateway CloudWatch role is configured for the region — **satisfied 2026-07-29, still verified every time** | Access logging and execution logging silently do nothing without it. It is a **region-wide singleton** and is deliberately not declared in the template — a stack delete would clear it for every API in the region |
 | 3 | The Secrets Manager secret exists and the execution role can read it | Phase 1D. Unrelated to this stack, but a gated route returns `503` without it |
 | 4 | A parameter file exists **outside** the repository | Copy `parameters.example.json`, fill it in, keep the filled copy out of Git |
 | 5 | The exact production origin has been approved by the owner | It is a `ProductionOrigin` parameter value, never a committed string |
@@ -116,7 +163,7 @@ aws apigateway get-account --region us-east-2 --query cloudwatchRoleArn --output
 
 An empty result means access logs and execution logs will be configured on the
 stage and never written. **This is the check that failed on the first attempt.**
-It is the expected first-attempt failure, not a surprise, and
+It was the expected first-attempt failure, not a surprise, and
 `scripts/setup-apigw-cloudwatch-role.ps1` exists to satisfy it:
 
 ```powershell
@@ -130,6 +177,32 @@ sets the account value, and reads it back to verify. If a role of that name
 already exists with a different trust policy or extra attached policies, it
 **stops rather than overwriting it** — a role this procedure does not own may be
 serving something else.
+
+#### This prerequisite was satisfied on 2026-07-29
+
+Run on Windows by the administrator: plan mode first, which reported what it
+would do and **changed nothing**, then `-Apply`.
+
+| Item | Result |
+| --- | --- |
+| IAM role | **`GracefulGutAI-APIGatewayCloudWatchRole`** created |
+| Trust policy | Trusts **only** `apigateway.amazonaws.com` |
+| Attached policies | **Only** `AmazonAPIGatewayPushToCloudWatchLogs`. No customer-managed policy, no inline policy |
+| Account value | The `us-east-2` API Gateway `cloudwatchRoleArn` was **set and verified** by read-back |
+
+**IAM propagation required retries, and the retries succeeded.** The account-level
+`PATCH` initially failed because the newly created role had not yet propagated —
+API Gateway checks that it can assume the role at the moment the account value is
+written, and IAM is eventually consistent. The script retried and the final
+verification passed.
+
+Expect this on any fresh run, and do not misread it. A hand-run version of this
+procedure would show one failure on a correctly created role, and the natural
+conclusion — that the trust policy is wrong — is the wrong one. If it does not
+clear on retry, check the trust policy before assuming propagation.
+
+The role ARN is not recorded here. The role **name** is an identifier, not a
+credential; the ARN carries the account ID and is never committed.
 
 ---
 
@@ -163,6 +236,83 @@ Two further rules for the completed parameter file:
   PowerShell 5.1 writes a BOM, and a BOM makes the CLI's JSON parser fail on the
   first character — which reads like a malformed parameter file rather than an
   encoding problem.
+
+---
+
+## 0b. Approved owner decisions — F1 to F4
+
+Approved by the owner on 2026-07-29. These are the values a change set is
+reviewed against; they are no longer open questions.
+
+### F1 — WAF sampled requests
+
+**Approved for private dev and count-mode validation using synthetic traffic.
+Re-evaluate before accepting real public health questions.**
+
+The approval is scoped to synthetic traffic, which is what makes it cheap: the
+~3 hours of unredactable IP retention applies to test requests generated by the
+administrator, not to a member of the public describing a symptom. That scoping
+is the decision, and it expires the moment real questions arrive. **Sampling must
+be re-evaluated before the education route accepts public traffic** — it does not
+carry forward automatically.
+
+This refines Phase 1E open decision 4. WAF **logging** remains **off** and is not
+approved; unlike access logs it cannot omit the client IP at all.
+
+### F2 — rate limiting
+
+| Control | Approved value | Template parameter |
+| --- | --- | --- |
+| Education route throttle, steady | **1 request per second** | `EducationRouteRateLimit` |
+| Education route throttle, burst | **2** | `EducationRouteBurstLimit` |
+| WAF rate-based rule, education route | **100** per five minutes, as a broader backstop | `WafEducationRouteRateLimit` |
+| WAF rate-rule action, while the route is off | **`Count` is acceptable** while `EnableEducationRoute=false` | `WafRateRuleAction` |
+
+**`WafRateRuleAction` must be `Block` before public education traffic is
+enabled.** A rate rule in `Count` protects nothing, and the education route is
+the only one that costs model spend. This is a release condition, not a
+preference — see section 6, condition 5.
+
+Per-method API Gateway throttling is the **primary** control at 1 rps / burst 2;
+the WAF rule at 100 is a **backstop**, and 100 is the AWS floor rather than a
+chosen number. This supersedes the Phase 1E proposal of 40 and 60 requests per
+five minutes for the chat route, which AWS will not accept as a rate-based limit.
+
+### F3 — names for the first deployment
+
+| Item | Approved value |
+| --- | --- |
+| `StageName` | **`dev`** |
+| Stack name | **`graceful-gut-ai-dev-infrastructure`** |
+
+`<STACK_NAME>` in the commands below resolves to the approved stack name. It is
+an identifier, not a credential, so it is recorded here rather than left as a
+fill-in-at-use placeholder. The remaining placeholders — `<AWS_ACCOUNT_ID>`,
+`<API_ID>`, `<PARAMETERS_FILE>`, `<SQUARESPACE_PRODUCTION_ORIGIN>` — are still
+never committed.
+
+### F4 — who executes change sets
+
+**AJ is the named administrator** responsible for reviewing and executing
+infrastructure change sets, from the Windows administrator session.
+
+Not this host, and not any Claude session: `GracefulGutAI-ClaudeDevRole` holds
+none of the required actions, by design. Review and execution are one
+accountable person's job.
+
+### What F1 to F4 do not decide
+
+They are infrastructure decisions. None of them is a launch approval, and each of
+the following remains **open** and, where marked, launch-blocking:
+
+| Item | Status |
+| --- | --- |
+| **L1** legal and compliance determination | **Open — launch-blocking** |
+| **L2** model-provider data-flow determination | **Open — launch-blocking** |
+| Browser authentication / the `X-GG-Key` replacement | **Open — launch-blocking** |
+| Application boundary enforcement in the request path | **Open — launch-blocking** |
+| Public production launch approval | **Open — not given** |
+| `GracefulGutAI-LambdaExecutionRole` audit | **Open** — carried from Phase 1D |
 
 ---
 
@@ -470,11 +620,22 @@ this stack:
 4. **Boundary enforcement in the request path** — educational only, no
    diagnosis, no prescribing, no lab interpretation, enforced in code on every
    response rather than in prompt text alone.
-5. `WafRateRuleAction=Block`. A rate rule in `Count` protects nothing, and the
-   education route is the only one that costs model spend.
+5. **`WafRateRuleAction=Block`.** A rate rule in `Count` protects nothing, and
+   the education route is the only one that costs model spend. Owner decision
+   **F2** permits `Count` only while `EnableEducationRoute=false`, and requires
+   `Block` before public education traffic is enabled.
 6. Managed rule groups reviewed against a corpus of realistic gut-health
    phrasings, with specific rule IDs excluded — never a whole group disabled.
 7. A monthly budget, from which throttles, token caps, and alarm thresholds are
    derived rather than guessed.
 8. A new deployment created after the update, or the route exists in the
    template and not to callers.
+9. **WAF sampled requests re-evaluated.** Owner decision **F1** approved sampling
+   for private dev and count-mode validation on **synthetic** traffic only, and
+   requires a fresh decision before real public health questions are accepted.
+10. **Public production launch approval, explicitly given.** It has not been.
+    Approving F1 through F4 was an infrastructure decision and is not a launch
+    approval.
+
+**F1 through F4 do not shorten this list.** They settled how the stack is
+configured; conditions 1, 2, 3, 4, 9, and 10 are all still open.
