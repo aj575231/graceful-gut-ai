@@ -2607,7 +2607,7 @@ def test_the_harness_asserts_every_aws_call_reached_the_fake_cli() -> None:
     counts = [
         int(value) for value in re.findall(r"ExpectedCalls\s*=\s*(\d+)", RUNTIME_CODE)
     ]
-    assert len(counts) == 7, f"expected seven scenarios to assert a count, got {counts}"
+    assert len(counts) == 9, f"expected nine scenarios to assert a count, got {counts}"
     assert all(count > 0 for count in counts)
 
 
@@ -2682,6 +2682,8 @@ REQUIRED_SCENARIOS = {
     "E": "function configuration with a null Role",
     "F": "secret grant on every secret",
     "G": "inline policy under an unrecognised name",
+    "H": "zero inline policies",
+    "I": "several unrecognised inline policies",
 }
 
 
@@ -2739,6 +2741,70 @@ def test_the_clean_scenario_reaches_the_end_and_writes_a_review() -> None:
     assert "ExpectReview   = $true" in block
     assert "Audit complete. Nothing was changed." in block
     assert "**Overall: PASS**" in block
+
+
+def test_both_policy_lists_get_the_zero_one_and_many_treatment() -> None:
+    """The rule B and C establish for attached policies, applied to the inline
+    list too.
+
+    It had it at the unit level -- ``test_inline_policies_normalise_for_zero_one
+    _and_many`` -- but every *runtime* scenario fed the audit exactly one inline
+    policy, so two branches had never actually executed: the empty list, which
+    records a REVIEW of its own, and a list long enough for one stage to record
+    more than one finding. Both were converted by the single-collection rewrite,
+    and a converted branch that never runs is the shape of the last three
+    failures in this phase.
+    """
+    blocks = harness_scenario_blocks()
+
+    def override_of(key: str) -> dict[str, str]:
+        """Each scenario's override of one fixture list, by scenario name.
+
+        Sliced from the fixture key to ``ExpectedExit``, the field that always
+        follows the Fixtures block, rather than by matching the quoting. Scenario
+        C uses a here-string and the others use ordinary quotes, and a pattern
+        that understood only one of those would quietly find nothing.
+        """
+        found = {}
+        for name, block in blocks.items():
+            if f"'{key}'" not in block:
+                continue
+            body = block[block.index(f"'{key}'") + len(key) + 2 :]
+            found[name] = body[: body.index("ExpectedExit")]
+        return found
+
+    for key, label in (
+        ("iam_list-attached-role-policies", "attached managed"),
+        ("iam_list-role-policies", "inline"),
+    ):
+        overrides = override_of(key)
+        assert overrides, f"no scenario overrides the {label} policy list at all"
+
+        empty = [n for n, body in overrides.items() if re.search(r"=\s*'\[\]'", body)]
+        assert empty, f"no scenario feeds zero {label} policies"
+
+        several = [n for n, body in overrides.items() if "},{" in body or '","' in body]
+        assert several, f"no scenario feeds several {label} policies"
+
+
+def test_the_many_inline_scenario_records_more_than_one_finding() -> None:
+    """The only scenario in which a single stage records two findings, which is
+    exactly what the single-collection rewrite changed: the collection must
+    accumulate the second rather than replace the first."""
+    block = harness_scenario_blocks()["I. several unrecognised inline policies"]
+
+    # Its own fixture, not just its expectations. Asserting only on the expected
+    # counts would keep passing if the fixture were collapsed back to one policy,
+    # leaving a scenario that asserts two findings against a role that has one.
+    fixture = block[block.index("'iam_list-role-policies'") :]
+    fixture = fixture[: fixture.index("ExpectedExit")]
+    assert fixture.count("GracefulGutAI-") == 2, f"not a two-policy fixture: {fixture}"
+
+    assert "FAIL: 0. REVIEW: 2." in block, "the review does not count two findings"
+    assert block.count("Inline policy is not part of the documented setup") == 4, (
+        "both findings are not asserted in both the terminal and the review"
+    )
+    assert "ExpectedExit   = 0" in block, "two REVIEWs is still not a failed run"
 
 
 @pytest.mark.parametrize(
@@ -3270,7 +3336,7 @@ def test_the_completed_scenarios_require_no_diagnostic_at_all() -> None:
         if "ExpectReview   = $true" in block
     }
 
-    assert len(completed) == 5, f"completed scenarios found: {sorted(completed)}"
+    assert len(completed) == 7, f"completed scenarios found: {sorted(completed)}"
 
     for name, block in completed.items():
         prohibited = block[block.index("MustNotContain") :]

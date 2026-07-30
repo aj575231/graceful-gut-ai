@@ -381,7 +381,7 @@ function Get-Scenarios {
         Every case this harness runs, in order.
 
     .DESCRIPTION
-        The seven cover the two failure classes and the review-gating rules:
+        The nine cover the two failure classes and the review-gating rules:
 
           A  the clean role -- one attached policy, one inline policy, the
              AWS-managed key, the expected trust policy. Proves the whole audit
@@ -392,12 +392,21 @@ function Get-Scenarios {
           E  a function configuration whose Role is null.
           F  a real security finding: the secret grant on every secret.
           G  an inline policy under an unrecognised name.
+          H  zero inline policies.
+          I  several inline policies, none of them recognised.
 
         B and C exist because "one" is not the interesting case on its own -- the
         first failure was a one-item collection, and a fix that handled one while
         breaking zero would look correct. D and E are the second failure's
         territory: each names a different required field, and each must fail with
         that field's own message rather than a shared one.
+
+        H and I apply that same zero/one/many rule to the *inline* list, which
+        had it only at the unit level. Every runtime scenario before them fed the
+        audit exactly one inline policy, so two branches had never executed here:
+        the empty list, which records a REVIEW of its own, and a list long enough
+        for one stage to record more than one finding. Both are branches the
+        single-collection rewrite changed.
 
         G is the third failure's territory, and it is the reason this harness
         gained a scenario rather than an assertion. The first successful live
@@ -595,6 +604,80 @@ function Get-Scenarios {
                 '| Inline policies | REVIEW |',
                 'Inline policy is not part of the documented setup: GracefulGutAI-LegacyInlinePolicy',
                 '## Least-privilege corrections'
+            )
+        })
+
+    # --- H: zero inline policies ---------------------------------------------
+    # The inline side of the zero/one/many rule B and C apply to attached
+    # policies. Until this scenario the inline list was only ever exercised with
+    # exactly one entry, so the empty branch -- which records a REVIEW of its own,
+    # and is one of the branches converted from a bare print -- had never run.
+    #
+    # One call fewer than A: nothing to read a document for.
+    $scenarios.Add(@{
+            Name           = 'H. zero inline policies'
+            Fixtures       = New-FixtureSet -Override @{
+                'iam_list-role-policies' = '[]'
+            }
+            ExpectedExit   = 0
+            ExpectReview   = $true
+            ExpectedCalls  = 8
+            MustContain    = @(
+                'No inline policy is present',
+                'Execution role audit: REVIEW',
+                'Audit complete. Nothing was changed.'
+            )
+            MustNotContain = @(
+                'Audit did not complete',
+                'DIAGNOSTIC:',
+                'Resolved inline policy:',
+                'Execution role audit: PASS'
+            )
+            ReviewContains = @(
+                '**Overall: REVIEW**',
+                'FAIL: 0. REVIEW: 1.',
+                '| Inline policies | REVIEW |',
+                'No inline policy is present'
+            )
+        })
+
+    # --- I: several inline policies, none recognised -------------------------
+    # "Many" for the inline list, and the only scenario in which one stage
+    # records more than one finding. That combination is what the single-collection
+    # rewrite actually changed, and nothing else here exercises it:
+    #
+    #   * the collection accumulates two findings rather than replacing one
+    #   * Get-StageSeverity aggregates both under the same stage
+    #   * the findings table renders two rows and the count reads REVIEW: 2
+    #
+    # Both documents are the clean secret grant, so the names remain the only
+    # thing wrong and the count cannot be inflated by a permission finding.
+    $scenarios.Add(@{
+            Name           = 'I. several unrecognised inline policies'
+            Fixtures       = New-FixtureSet -Override @{
+                'iam_list-role-policies' = '["GracefulGutAI-LegacyInlinePolicy","GracefulGutAI-SecondLegacyPolicy"]'
+            }
+            ExpectedExit   = 0
+            ExpectReview   = $true
+            ExpectedCalls  = 10
+            MustContain    = @(
+                'Inline policy is not part of the documented setup: GracefulGutAI-LegacyInlinePolicy',
+                'Inline policy is not part of the documented setup: GracefulGutAI-SecondLegacyPolicy',
+                'Execution role audit: REVIEW',
+                'Audit complete. Nothing was changed.'
+            )
+            MustNotContain = @(
+                'Audit did not complete',
+                'DIAGNOSTIC:',
+                'Execution role audit: PASS',
+                'No inline policy is present'
+            )
+            ReviewContains = @(
+                '**Overall: REVIEW**',
+                'FAIL: 0. REVIEW: 2.',
+                '| Inline policies | REVIEW |',
+                'Inline policy is not part of the documented setup: GracefulGutAI-LegacyInlinePolicy',
+                'Inline policy is not part of the documented setup: GracefulGutAI-SecondLegacyPolicy'
             )
         })
 
