@@ -264,6 +264,18 @@ no IAM write actions. All require administrator credentials, run elsewhere.
      --policy-document file://infrastructure/lambda-execution-secrets-policy.json
    ```
 
+   > **Superseded on 2026-07-30 — the policy name above is not the deployed
+   > one.** Left as written because this is the record of what Phase 1D
+   > recommended, and rewriting it would erase where the wrong expectation came
+   > from. The first successful Phase 1G execution-role audit found the deployed
+   > role carrying its secret grant as `GracefulGutAI-SecretAccess`, correctly
+   > scoped to the one expected secret. `GracefulGutAI-ReadApiKeySecret` appears
+   > nowhere in this repository as a record of a run — only as this
+   > recommendation and its copies in `CLAUDE.md` and
+   > `infrastructure/README.md`, both of which now name the deployed policy. Do
+   > not run the command as printed here; see
+   > `docs/audits/phase1g-lambda-execution-role-audit-2026-07-29.md`.
+
 3. **Audit the execution role's existing policies.** They are still not readable
    from the dev role and remain unaudited — carried over from the Phase 1
    remediation report, not introduced here.

@@ -191,11 +191,23 @@ $QueryRequiredOperations = @(
 # What the role is expected to look like
 # ---------------------------------------------------------------------------
 
-#: The inline policy the documented setup creates. CLAUDE.md has an administrator
-#: run `iam put-role-policy --policy-name GracefulGutAI-ReadApiKeySecret`, which
-#: makes an inline policy of that name part of the expected configuration rather
-#: than a deviation. Any other inline policy is a REVIEW, not a pass.
-$ExpectedInlinePolicyName = 'GracefulGutAI-ReadApiKeySecret'
+#: The inline policy that carries the secret grant on the deployed role. Any
+#: other inline policy is a REVIEW, not a pass.
+#:
+#: This name is what is actually deployed, established by the first successful
+#: live audit. The repository previously expected 'GracefulGutAI-ReadApiKeySecret'
+#: and was wrong to: that name only ever appeared in an administrator *instruction*
+#: -- in CLAUDE.md, infrastructure/README.md, and the Phase 1D report -- and never
+#: in a record of what was run. It appears in no commit as a deployed fact, and
+#: 'GracefulGutAI-SecretAccess' appeared in no commit at all until this one.
+#:
+#: The live audit resolved this policy and found it grants exactly one Secrets
+#: Manager action, scoped to the expected secret, with no other permission. So the
+#: deployed policy is correct and only its name was undocumented. Renaming an IAM
+#: policy that grants the right thing, purely to match a document that was never a
+#: record, would be a live IAM change made to protect a stale expectation.
+#: The document is what moved.
+$ExpectedInlinePolicyName = 'GracefulGutAI-SecretAccess'
 
 #: The managed policy a Lambda execution role is normally given for logging.
 $ExpectedManagedPolicyNames = @(
@@ -277,13 +289,44 @@ $script:AccountId = $null
 $script:ExpectedSecretArn = $null
 $script:ExitCode = 0
 $script:StagesCompleted = $false
-$script:PermissionFindings = New-Object System.Collections.Generic.List[object]
+
+#: **The** finding collection. Every REVIEW and every FAIL the run produces is in
+#: here, and nothing produces one without going through Add-Finding.
+#:
+#: There used to be three places findings lived: this list, a local list inside
+#: the trust stage, and -- for the policy-resolution stages -- nowhere at all,
+#: because those stages printed a classification straight to the terminal and kept
+#: no record. The first successful live audit is what exposed the cost. The
+#: terminal reported `Resolved inline policy: <name> -- not part of the documented
+#: setup` as a REVIEW; the generated review, which counted only this list plus the
+#: trust stage's own, reported `Overall: PASS` and `REVIEW: 0`. Two documents
+#: disagreeing about the same run is worse than either being wrong on its own,
+#: because there is no way to tell from the artefacts which one to believe.
+#:
+#: It is never reset mid-run. A stage that cleared it would silently discard every
+#: finding recorded before it -- which is exactly what the permission stage used
+#: to do to the stages ahead of it.
+$script:AuditFindings = New-Object System.Collections.Generic.List[object]
 
 #: The stage currently running, for the failure diagnostic. Write-Section is the
 #: single place a stage begins, so it is the single place this is set. The value
 #: is always a literal from this file -- never a path, an identifier, or a value
 #: read from AWS -- which is what makes it safe to print on failure.
 $script:Stage = 'startup'
+
+#: The audit stages, in order, as the review's Stages table lists them. These are
+#: the titles Write-Section is called with, so a finding's Stage matches one of
+#: them and the table is built from the finding collection rather than from a
+#: second set of severities kept alongside it.
+$AuditStages = @(
+    'Caller',
+    'Function',
+    'Expected secret',
+    'Trust policy',
+    'Attached managed policies',
+    'Inline policies',
+    'Effective permissions'
+)
 
 # ---------------------------------------------------------------------------
 # Outcome vocabulary -- the single place these words can be produced
@@ -331,7 +374,17 @@ function Get-WorstSeverity {
     return 'Pass'
 }
 
-function Write-Finding {
+function Write-Classification {
+    <#
+    .SYNOPSIS
+        Print one classified line. Private -- callers use the four writers below.
+
+    .DESCRIPTION
+        Deliberately not exported to the rest of the script by convention: every
+        call site goes through Write-Step, Add-Finding, or Write-Verdict, so a
+        REVIEW or a FAIL cannot reach the terminal without also being recorded.
+        That is the whole point of splitting the old Write-Finding in two.
+    #>
     param(
         [Parameter(Mandatory = $true)]
         [ValidateSet('Pass', 'Review', 'Fail')]
@@ -351,6 +404,63 @@ function Write-Finding {
     if (-not [string]::IsNullOrWhiteSpace($Detail)) {
         Write-Host "         $(Hide-Sensitive -Text $Detail)" -ForegroundColor DarkGray
     }
+}
+
+function Write-Step {
+    <#
+    .SYNOPSIS
+        A step went as expected. Prints PASS, records nothing.
+
+    .DESCRIPTION
+        It cannot print anything but PASS, and that is the constraint doing the
+        work: a stage reporting progress has no way to emit a REVIEW or a FAIL
+        without calling Add-Finding, so the terminal cannot classify something the
+        review has never heard of.
+
+        Resolving a canonically named policy whose document parses is a step, not
+        a finding. Nothing is wrong, so there is nothing for an administrator to
+        decide, and putting it in the findings table would bury the entries that
+        do need a decision.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $false)][string]$Detail = ''
+    )
+
+    Write-Classification -Severity 'Pass' -Name $Name -Detail $Detail
+}
+
+function Write-Detail {
+    <#
+    .SYNOPSIS
+        An unclassified informational line.
+
+    .DESCRIPTION
+        For counts and summaries. The per-category action counts used to be
+        printed as PASS or FAIL, which duplicated a judgement the individual
+        findings had already made and gave the run a second, independently
+        computed opinion about the same permissions. A number is reported as a
+        number; the findings below it carry the verdict.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    Write-Host "         $(Hide-Sensitive -Text $Text)" -ForegroundColor DarkGray
+}
+
+function Write-Verdict {
+    <#
+    .SYNOPSIS
+        The single overall line. Called once, from the Verdict stage.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Pass', 'Review', 'Fail')]
+        [string]$Severity,
+
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    Write-Classification -Severity $Severity -Name $Name
 }
 
 function Write-Section {
@@ -381,7 +491,7 @@ function Add-Finding {
     #>
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('Pass', 'Review', 'Fail')]
+        [ValidateSet('Review', 'Fail')]
         [string]$Severity,
 
         [Parameter(Mandatory = $true)][string]$Title,
@@ -389,12 +499,57 @@ function Add-Finding {
         [Parameter(Mandatory = $false)][string]$Correction = ''
     )
 
-    $script:PermissionFindings.Add([pscustomobject]@{
+    # Recorded and printed in one call, so the two cannot come apart. A finding
+    # that was printed but not recorded is what made a completed audit report
+    # REVIEW on screen and PASS in the file it wrote.
+    $script:AuditFindings.Add([pscustomobject]@{
             Severity   = $Severity
             Title      = $Title
             Where      = $Where
             Correction = $Correction
+            Stage      = [string]$script:Stage
         })
+
+    Write-Classification -Severity $Severity -Name $Title -Detail $Where
+}
+
+function Get-OverallSeverity {
+    <#
+    .SYNOPSIS
+        The run's verdict, computed from the one finding collection.
+
+    .DESCRIPTION
+        One implementation, called by both the Verdict stage and the review. Two
+        computations of "the overall result" is how a terminal and a file end up
+        disagreeing, even when both are reading correct data.
+
+          any FAIL             -> Fail
+          no FAIL, any REVIEW  -> Review
+          neither              -> Pass
+    #>
+    $severities = New-Object System.Collections.Generic.List[string]
+    foreach ($finding in $script:AuditFindings) {
+        $severities.Add([string]$finding.Severity)
+    }
+
+    return (Get-WorstSeverity -Severities ([string[]]$severities.ToArray()))
+}
+
+function Get-StageSeverity {
+    <#
+    .SYNOPSIS
+        The worst finding recorded during one named stage, or Pass if it had none.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Stage)
+
+    $severities = New-Object System.Collections.Generic.List[string]
+    foreach ($finding in $script:AuditFindings) {
+        if ([string]$finding.Stage -eq $Stage) {
+            $severities.Add([string]$finding.Severity)
+        }
+    }
+
+    return (Get-WorstSeverity -Severities ([string[]]$severities.ToArray()))
 }
 
 function Hide-Sensitive {
@@ -1043,7 +1198,7 @@ policies and cannot run this audit.
 
     # Recorded only so Hide-Sensitive can mask it. It is never printed.
     $script:AccountId = $accountId
-    Write-Finding -Severity 'Pass' -Name 'Caller identity resolved' `
+    Write-Step -Name 'Caller identity resolved' `
         -Detail 'account ID read for masking only, never printed'
 
     return $accountId
@@ -1100,20 +1255,22 @@ function Get-FunctionRoleName {
         -What 'the function configuration'
 
     $isActive = ($state -eq 'Active')
-    $stateSeverity = 'Fail'
-    if ($isActive) { $stateSeverity = 'Pass' }
-    Write-Finding -Severity $stateSeverity `
-        -Name 'Function state is Active' -Detail "reported: $state"
-    if (-not $isActive) {
+    if ($isActive) {
+        Write-Step -Name 'Function state is Active' -Detail "reported: $state"
+    }
+    else {
+        Add-Finding -Severity 'Fail' -Title 'Function state is not Active' `
+            -Where "reported: $state"
         Stop-Run -Message "Function '$FunctionName' is not Active (state: $state)."
     }
 
     $isSuccessful = ($lastUpdate -eq 'Successful')
-    $updateSeverity = 'Fail'
-    if ($isSuccessful) { $updateSeverity = 'Pass' }
-    Write-Finding -Severity $updateSeverity `
-        -Name 'Last update status is Successful' -Detail "reported: $lastUpdate"
-    if (-not $isSuccessful) {
+    if ($isSuccessful) {
+        Write-Step -Name 'Last update status is Successful' -Detail "reported: $lastUpdate"
+    }
+    else {
+        Add-Finding -Severity 'Fail' -Title 'Last update status is not Successful' `
+            -Where "reported: $lastUpdate"
         Stop-Run -Message "Function '$FunctionName' last update was not Successful (status: $lastUpdate)."
     }
 
@@ -1121,11 +1278,15 @@ function Get-FunctionRoleName {
         -What "function's configured role"
 
     $matchesExpected = ($configuredRoleName -eq $RoleName)
-    $roleSeverity = 'Fail'
-    if ($matchesExpected) { $roleSeverity = 'Pass' }
-    Write-Finding -Severity $roleSeverity `
-        -Name "Function's execution role is the role being audited" `
-        -Detail 'compared by role name; the ARN is never printed'
+    if ($matchesExpected) {
+        Write-Step -Name "Function's execution role is the role being audited" `
+            -Detail 'compared by role name; the ARN is never printed'
+    }
+    else {
+        Add-Finding -Severity 'Fail' `
+            -Title "Function's execution role is not the role being audited" `
+            -Where 'compared by role name; the ARN is never printed'
+    }
 
     if (-not $matchesExpected) {
         Stop-Run -Message @"
@@ -1174,8 +1335,8 @@ function Get-ExpectedSecret {
         -AllowFailure
 
     if (-not $result.Succeeded) {
-        Write-Finding -Severity 'Fail' -Name 'Expected secret could not be described' `
-            -Detail 'the identifier may be wrong, or the caller may lack secretsmanager:DescribeSecret'
+        Add-Finding -Severity 'Fail' -Title 'Expected secret could not be described' `
+            -Where 'the identifier may be wrong, or the caller may lack secretsmanager:DescribeSecret'
         Stop-Run -Message @"
 Could not describe the expected secret.
 
@@ -1207,12 +1368,12 @@ $($result.Output)
         $kmsKeyId -eq 'alias/aws/secretsmanager'
     )
 
-    Write-Finding -Severity 'Pass' -Name 'Expected secret resolved (metadata only)' `
+    Write-Step -Name 'Expected secret resolved (metadata only)' `
         -Detail 'the value was not read, and this script cannot read it'
 
     $keyDescription = 'AWS-managed key'
     if ($usesCustomerKey) { $keyDescription = 'customer-managed key' }
-    Write-Finding -Severity 'Pass' -Name "Secret encryption: $keyDescription" `
+    Write-Step -Name "Secret encryption: $keyDescription" `
         -Detail 'determines whether a kms:Decrypt grant is justified'
 
     return [pscustomobject]@{
@@ -1261,7 +1422,6 @@ this role but none of the policy-listing actions this audit needs.
         -Document $roleRecord.AssumeRolePolicyDocument `
         -What 'the trust policy'
 
-    $findings = New-Object System.Collections.Generic.List[object]
     $servicePrincipals = New-Object System.Collections.Generic.List[string]
 
     if (-not (Test-HasProperty -Object $document -Name 'Statement')) {
@@ -1322,10 +1482,9 @@ this role but none of the policy-listing actions this audit needs.
                 'Federated' { $sawFederatedPrincipal = $true }
                 'CanonicalUser' { $sawAccountPrincipal = $true }
                 default {
-                    $findings.Add([pscustomobject]@{
-                            Severity = 'Review'
-                            Title    = "Unrecognised trust principal type: $key"
-                        })
+                    Add-Finding -Severity 'Review' `
+                        -Title "Unrecognised trust principal type: $key" `
+                        -Where 'trust policy'
                 }
             }
         }
@@ -1335,16 +1494,15 @@ this role but none of the policy-listing actions this audit needs.
         $servicePrincipals.Count -eq 1 -and
         $servicePrincipals[0] -eq $ExpectedTrustPrincipal
     )
-    $severity = 'Fail'
-    if ($onlyLambda) { $severity = 'Pass' }
-    Write-Finding -Severity $severity `
-        -Name "$ExpectedTrustPrincipal is the only trusted service principal" `
-        -Detail "service principals found: $($servicePrincipals.Count)"
-    if (-not $onlyLambda) {
-        $findings.Add([pscustomobject]@{
-                Severity = 'Fail'
-                Title    = "Trust policy does not trust exactly $ExpectedTrustPrincipal"
-            })
+    if ($onlyLambda) {
+        Write-Step -Name "$ExpectedTrustPrincipal is the only trusted service principal" `
+            -Detail "service principals found: $($servicePrincipals.Count)"
+    }
+    else {
+        Add-Finding -Severity 'Fail' `
+            -Title "Trust policy does not trust exactly $ExpectedTrustPrincipal" `
+            -Where "service principals found: $($servicePrincipals.Count)" `
+            -Correction "Trust only $ExpectedTrustPrincipal."
     }
 
     $checks = @(
@@ -1358,22 +1516,18 @@ this role but none of the policy-listing actions this audit needs.
     )
 
     foreach ($check in $checks) {
-        $bad = [bool]$check.Bad
-        $found = 'Pass'
-        if ($bad) { $found = [string]$check.Severity }
-        Write-Finding -Severity $found -Name ([string]$check.Name)
-        if ($bad) {
-            $findings.Add([pscustomobject]@{
-                    Severity = [string]$check.Severity
-                    Title    = "Trust policy: $([string]$check.Name) -- violated"
-                })
+        if ([bool]$check.Bad) {
+            Add-Finding -Severity ([string]$check.Severity) `
+                -Title "Trust policy: $([string]$check.Name) -- violated" `
+                -Where 'trust policy'
+        }
+        else {
+            Write-Step -Name ([string]$check.Name)
         }
     }
 
     return [pscustomobject]@{
-        Findings          = $findings
         ServicePrincipals = $servicePrincipals
-        Severity          = (Get-WorstSeverity -Severities @($findings | ForEach-Object { $_.Severity }))
     }
 }
 
@@ -1415,8 +1569,9 @@ function Get-AttachedPolicyDocuments {
     $policies = New-Object System.Collections.Generic.List[object]
 
     if ($rows.Count -eq 0) {
-        Write-Finding -Severity 'Review' -Name 'No managed policy is attached' `
-            -Detail 'a Lambda without log permissions writes no logs'
+        Add-Finding -Severity 'Review' -Title 'No managed policy is attached' `
+            -Where 'a Lambda without log permissions writes no logs' `
+            -Correction "Attach $($ExpectedManagedPolicyNames -join ', ') unless logging is granted inline."
     }
 
     foreach ($row in $rows) {
@@ -1464,7 +1619,7 @@ function Get-AttachedPolicyDocuments {
         $kind = 'customer-managed'
         if ($isAwsManaged) { $kind = 'AWS-managed' }
 
-        Write-Finding -Severity 'Pass' -Name "Resolved $kind policy: $policyName" `
+        Write-Step -Name "Resolved $kind policy: $policyName" `
             -Detail "default version $versionId"
 
         $policies.Add([pscustomobject]@{
@@ -1487,8 +1642,13 @@ function Get-InlinePolicyDocuments {
 
     .DESCRIPTION
         Inline policies are expected here, not suspicious in themselves: the
-        documented setup in CLAUDE.md creates one with put-role-policy for the
-        secret grant. So the expected name passes and anything else is a REVIEW.
+        setup creates one with put-role-policy for the secret grant. So the
+        expected name passes and anything else is a REVIEW.
+
+        The expected name is the one the role actually carries, not the one the
+        setup instructions name -- see $ExpectedInlinePolicyName. Those two were
+        not the same, and expecting the instruction's name made the audit flag
+        the correct deployed policy.
     #>
     Write-Section 'Inline policies'
 
@@ -1506,8 +1666,9 @@ function Get-InlinePolicyDocuments {
     $policies = New-Object System.Collections.Generic.List[object]
 
     if ($names.Count -eq 0) {
-        Write-Finding -Severity 'Review' -Name 'No inline policy is present' `
-            -Detail "the documented setup creates '$ExpectedInlinePolicyName'"
+        Add-Finding -Severity 'Review' -Title 'No inline policy is present' `
+            -Where "the documented setup creates '$ExpectedInlinePolicyName'" `
+            -Correction "Create '$ExpectedInlinePolicyName', or confirm the secret grant is carried elsewhere."
     }
 
     foreach ($name in $names) {
@@ -1535,11 +1696,20 @@ function Get-InlinePolicyDocuments {
             -Document $documentRecord.PolicyDocument `
             -What "inline policy '$policyName'"
 
+        # The canonical name is a step. Any other name is a REVIEW that is
+        # *recorded*, not merely printed -- this is the exact line whose finding
+        # the first successful live audit lost on its way into the review file.
         $expected = ($policyName -eq $ExpectedInlinePolicyName)
-        $severity = 'Review'
-        if ($expected) { $severity = 'Pass' }
-        Write-Finding -Severity $severity -Name "Resolved inline policy: $policyName" `
-            -Detail $(if ($expected) { 'the documented secret-read policy' } else { 'not part of the documented setup' })
+        if ($expected) {
+            Write-Step -Name "Resolved inline policy: $policyName" `
+                -Detail 'the documented secret-read policy'
+        }
+        else {
+            Add-Finding -Severity 'Review' `
+                -Title "Inline policy is not part of the documented setup: $policyName" `
+                -Where "expected '$ExpectedInlinePolicyName'" `
+                -Correction "Confirm this policy is intended, then record its name as the documented one -- or remove it."
+        }
 
         $policies.Add([pscustomobject]@{
                 Name         = $policyName
@@ -1655,7 +1825,10 @@ function Test-PolicyStatements {
 
     Write-Section 'Effective permissions'
 
-    $script:PermissionFindings = New-Object System.Collections.Generic.List[object]
+    # Where this stage's findings begin. The collection is never reset -- the
+    # earlier stages' findings are in it and must survive.
+    $findingsBefore = $script:AuditFindings.Count
+
     $categoryCounts = [ordered]@{}
     foreach ($entry in $ActionCategories) { $categoryCounts[[string]$entry.Category] = 0 }
     $categoryCounts['Other'] = 0
@@ -1903,34 +2076,26 @@ function Test-PolicyStatements {
         }
     }
 
-    # Report the categories, then the findings. A category with a count of zero
-    # is a positive result and is worth showing.
+    # Each finding was printed by Add-Finding as it was recorded, so this reports
+    # the shape of what was classified. A category with a count of zero is a
+    # positive result and is worth showing. The counts are reported as counts: a
+    # second severity computed here would be a second opinion about permissions the
+    # findings have already judged, and two opinions are what this run must not
+    # produce.
     foreach ($category in $categoryCounts.Keys) {
-        $count = [int]$categoryCounts[$category]
-        $severity = 'Pass'
-        if ($count -gt 0 -and $category -notin @('CloudWatch Logs', 'Secrets Manager', 'KMS')) {
-            $severity = 'Fail'
-        }
-        Write-Finding -Severity $severity -Name "$category actions: $count"
+        Write-Detail -Text "$([string]$category) actions: $([int]$categoryCounts[$category])"
     }
 
-    foreach ($finding in $script:PermissionFindings) {
-        Write-Finding -Severity ([string]$finding.Severity) -Name ([string]$finding.Title) `
-            -Detail ([string]$finding.Where)
-    }
-
-    if ($script:PermissionFindings.Count -eq 0) {
-        Write-Finding -Severity 'Pass' -Name 'No least-privilege finding' `
+    if ($script:AuditFindings.Count -eq $findingsBefore) {
+        Write-Step -Name 'No least-privilege finding' `
             -Detail 'every granted action matched the expected posture'
     }
 
     return [pscustomobject]@{
-        Findings       = $script:PermissionFindings
         CategoryCounts = $categoryCounts
         ActionCount    = $actionCount
         StatementCount = $statementCount
         DenyCount      = $denyCount
-        Severity       = (Get-WorstSeverity -Severities @($script:PermissionFindings | ForEach-Object { $_.Severity }))
     }
 }
 
@@ -2021,13 +2186,21 @@ function New-ReviewFile {
         Nothing about redaction is relaxed to make the write succeed: the scan
         still runs on the finished text, and still means no file rather than a
         warned-about one.
+
+        It takes no findings, no per-stage severity, and no verdict as an
+        argument. All three are read from the one finding collection, through the
+        same functions the terminal used. That is deliberate: this function used
+        to be handed a $Trust and a $Permissions whose .Findings and .Severity
+        were the only inputs to the counts, the table, and the overall line, so a
+        finding classified anywhere else -- an inline policy with an
+        undocumented name, for one -- could not reach the file no matter how
+        loudly the terminal reported it. Passing the findings in was the defect;
+        the parameters are gone rather than corrected.
     #>
     param(
-        [Parameter(Mandatory = $true)]$Trust,
         [Parameter(Mandatory = $true)]$Permissions,
         [Parameter(Mandatory = $true)]$Policies,
         [Parameter(Mandatory = $true)]$Secret,
-        [Parameter(Mandatory = $true)][string]$Verdict,
         [Parameter(Mandatory = $true)][string]$Directory
     )
 
@@ -2048,13 +2221,16 @@ function New-ReviewFile {
     [object[]]$policyRows = @()
     if ($null -ne $Policies) { $policyRows = [object[]]$Policies }
 
-    [object[]]$trustFindings = @()
-    if ($null -ne $Trust.Findings) { $trustFindings = [object[]]$Trust.Findings }
+    # Every finding the run recorded, in the order it recorded them, converted
+    # element by element out of the generic List for the same 5.1 binding reason
+    # as the policy rows above. There is no second source to merge in.
+    $findingList = New-Object System.Collections.Generic.List[object]
+    foreach ($finding in $script:AuditFindings) { $findingList.Add($finding) }
+    [object[]]$allFindings = $findingList.ToArray()
 
-    [object[]]$permissionFindings = @()
-    if ($null -ne $Permissions.Findings) { $permissionFindings = [object[]]$Permissions.Findings }
-
-    [object[]]$allFindings = $trustFindings + $permissionFindings
+    # The same computation the Verdict stage printed, not a re-derivation.
+    [string]$overallSeverity = Get-OverallSeverity
+    [string]$Verdict = ConvertTo-Classification -Severity $overallSeverity
 
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('# Phase 1G - Lambda execution role audit')
@@ -2075,14 +2251,19 @@ function New-ReviewFile {
     $lines.Add('pasted into a task report as-is.')
     $lines.Add('')
 
+    # Every stage the run performs, each scored from the findings recorded while
+    # it was the current stage. The table used to be four hand-written rows, two
+    # of them the constant PASS -- so the three stages that could produce a
+    # finding but had no row, the inline-policy stage among them, were invisible
+    # here however they turned out.
     $lines.Add('## Stages')
     $lines.Add('')
     $lines.Add('| Stage | Result |')
     $lines.Add('| --- | --- |')
-    $lines.Add("| Function healthy and role confirmed | $(ConvertTo-Classification -Severity 'Pass') |")
-    $lines.Add("| Expected secret resolved (metadata only) | $(ConvertTo-Classification -Severity 'Pass') |")
-    $lines.Add("| Trust policy | $(ConvertTo-Classification -Severity $Trust.Severity) |")
-    $lines.Add("| Effective permissions | $(ConvertTo-Classification -Severity $Permissions.Severity) |")
+    foreach ($stage in $AuditStages) {
+        $stageSeverity = Get-StageSeverity -Stage ([string]$stage)
+        $lines.Add("| $([string]$stage) | $(ConvertTo-Classification -Severity $stageSeverity) |")
+    }
     $lines.Add('')
 
     $lines.Add('## Policies inspected')
@@ -2211,7 +2392,7 @@ try {
     $null = Get-CallerAccountId
     $null = Get-FunctionRoleName
     $secret = Get-ExpectedSecret
-    $trust = Test-TrustPolicy
+    $null = Test-TrustPolicy
 
     $policies = New-Object System.Collections.Generic.List[object]
     foreach ($policy in @(Get-AttachedPolicyDocuments)) { $policies.Add($policy) }
@@ -2219,14 +2400,17 @@ try {
 
     $permissions = Test-PolicyStatements -Policies $policies -Secret $secret
 
-    $overall = Get-WorstSeverity -Severities @($trust.Severity, $permissions.Severity)
+    # One collection, one computation. The review calls the same function, so the
+    # verdict on screen and the verdict in the file cannot be reached by two
+    # different routes and disagree.
+    $overall = Get-OverallSeverity
     $verdict = ConvertTo-Classification -Severity $overall
 
     # Every stage returned. Only now may a review be written.
     $script:StagesCompleted = $true
 
     Write-Section 'Verdict'
-    Write-Finding -Severity $overall -Name "Execution role audit: $verdict"
+    Write-Verdict -Severity $overall -Name "Execution role audit: $verdict"
 
     Write-Section 'Review'
     $tempRoot = $env:TEMP
@@ -2246,11 +2430,13 @@ somewhere outside the repository and re-run.
 "@
     }
 
-    $reviewPath = New-ReviewFile -Trust $trust -Permissions $permissions `
-        -Policies $policies -Secret $secret -Verdict $verdict -Directory $resolvedTemp
+    $reviewPath = New-ReviewFile -Permissions $permissions `
+        -Policies $policies -Secret $secret -Directory $resolvedTemp
 
     Write-Host "  Written: $reviewPath" -ForegroundColor Green
 
+    # PASS and REVIEW both completed, so both exit 0. Only FAIL exits 2. Exit 1 is
+    # reserved for a run that did not finish, and is set in the catch block.
     if ($overall -eq 'Fail') { $script:ExitCode = 2 }
 }
 catch {

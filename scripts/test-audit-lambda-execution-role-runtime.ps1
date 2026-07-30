@@ -146,8 +146,12 @@ function Get-BaseFixtures {
 {"Document":{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}}
 '@
 
-    # One inline policy, named the documented one.
-    $fixtures['iam_list-role-policies'] = '["GracefulGutAI-ReadApiKeySecret"]'
+    # One inline policy, named the canonical one -- 'GracefulGutAI-SecretAccess',
+    # the name the first successful live audit found deployed. It was
+    # 'GracefulGutAI-ReadApiKeySecret' here until that run, which is the name the
+    # setup instructions in CLAUDE.md use and which turned out never to have been
+    # the deployed name. Scenario G covers any other name.
+    $fixtures['iam_list-role-policies'] = '["GracefulGutAI-SecretAccess"]'
 
     $fixtures['iam_get-role-policy'] =
     "{`"PolicyDocument`":{`"Version`":`"2012-10-17`",`"Statement`":[{`"Effect`":`"Allow`",`"Action`":`"secretsmanager:GetSecretValue`",`"Resource`":`"arn:aws:secretsmanager:${FixtureRegion}:${PlaceholderAccountId}:secret:${FixtureSecretName}-*`"}]}}"
@@ -377,7 +381,7 @@ function Get-Scenarios {
         Every case this harness runs, in order.
 
     .DESCRIPTION
-        The six cover the two failure classes and the two review-gating rules:
+        The seven cover the two failure classes and the review-gating rules:
 
           A  the clean role -- one attached policy, one inline policy, the
              AWS-managed key, the expected trust policy. Proves the whole audit
@@ -387,12 +391,22 @@ function Get-Scenarios {
           D  a function configuration missing State.
           E  a function configuration whose Role is null.
           F  a real security finding: the secret grant on every secret.
+          G  an inline policy under an unrecognised name.
 
         B and C exist because "one" is not the interesting case on its own -- the
         first failure was a one-item collection, and a fix that handled one while
         breaking zero would look correct. D and E are the second failure's
         territory: each names a different required field, and each must fail with
         that field's own message rather than a shared one.
+
+        G is the third failure's territory, and it is the reason this harness
+        gained a scenario rather than an assertion. The first successful live
+        audit hit exactly this case -- an inline policy whose name was not the
+        expected one -- and produced a terminal that said REVIEW and a review file
+        that said `**Overall: PASS**` with `REVIEW: 0`. Both artefacts were
+        internally consistent, so nothing short of comparing them could catch it.
+        G asserts on the terminal *and* the file from one run, which is the only
+        arrangement that can see the two disagree.
 
         ExpectedCalls is asserted exactly. It is how this harness knows every AWS
         call went to the fake CLI: a call that resolved to something else would
@@ -410,13 +424,25 @@ function Get-Scenarios {
             ExpectedCalls  = 9
             MustContain    = @(
                 'Resolved AWS-managed policy: AWSLambdaBasicExecutionRole',
-                'Resolved inline policy: GracefulGutAI-ReadApiKeySecret',
+                'Resolved inline policy: GracefulGutAI-SecretAccess',
                 'Secret encryption: AWS-managed key',
                 'No least-privilege finding',
+                'Execution role audit: PASS',
                 'Audit complete. Nothing was changed.'
             )
-            MustNotContain = @('Audit did not complete', 'DIAGNOSTIC:')
-            ReviewContains = @('**Overall: PASS**', 'AWSLambdaBasicExecutionRole')
+            # Resolving the canonically named policy is a step, not a finding: it
+            # prints PASS and must not raise a REVIEW anywhere.
+            MustNotContain = @(
+                'Audit did not complete',
+                'DIAGNOSTIC:',
+                'not part of the documented setup',
+                'REVIEW'
+            )
+            ReviewContains = @(
+                '**Overall: PASS**',
+                'FAIL: 0. REVIEW: 0.',
+                'AWSLambdaBasicExecutionRole'
+            )
         })
 
     # --- B: zero attached policies -----------------------------------------
@@ -526,6 +552,49 @@ function Get-Scenarios {
             ReviewContains = @(
                 '**Overall: FAIL**',
                 'Scope Resource to the one expected secret ARN.'
+            )
+        })
+
+    # --- G: an inline policy under an unrecognised name ----------------------
+    # The live-audit case. The policy document is the clean one -- it grants
+    # exactly the expected secret read -- so the *only* thing wrong is the name,
+    # and a run that lost the finding would look completely clean. That is what
+    # happened: the terminal classified it REVIEW and the review file said PASS.
+    #
+    # This is the one scenario that asserts the same finding in all five places
+    # it has to appear, because any four of them agreeing is what the defect
+    # looked like from either artefact alone:
+    #
+    #   terminal        MustContain, the REVIEW line
+    #   REVIEW count    ReviewContains, 'FAIL: 0. REVIEW: 1.'
+    #   findings table  ReviewContains, the row
+    #   overall verdict ReviewContains and MustContain, REVIEW not PASS
+    #   exit code       ExpectedExit 0 -- a REVIEW is not a failure
+    $scenarios.Add(@{
+            Name           = 'G. inline policy under an unrecognised name'
+            Fixtures       = New-FixtureSet -Override @{
+                'iam_list-role-policies' = '["GracefulGutAI-LegacyInlinePolicy"]'
+            }
+            ExpectedExit   = 0
+            ExpectReview   = $true
+            ExpectedCalls  = 9
+            MustContain    = @(
+                'Inline policy is not part of the documented setup: GracefulGutAI-LegacyInlinePolicy',
+                "expected 'GracefulGutAI-SecretAccess'",
+                'Execution role audit: REVIEW',
+                'Audit complete. Nothing was changed.'
+            )
+            MustNotContain = @(
+                'Audit did not complete',
+                'DIAGNOSTIC:',
+                'Execution role audit: PASS'
+            )
+            ReviewContains = @(
+                '**Overall: REVIEW**',
+                'FAIL: 0. REVIEW: 1.',
+                '| Inline policies | REVIEW |',
+                'Inline policy is not part of the documented setup: GracefulGutAI-LegacyInlinePolicy',
+                '## Least-privilege corrections'
             )
         })
 

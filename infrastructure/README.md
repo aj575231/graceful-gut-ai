@@ -105,9 +105,21 @@ actions:
 ```bash
 aws iam put-role-policy \
   --role-name GracefulGutAI-LambdaExecutionRole \
-  --policy-name GracefulGutAI-ReadApiKeySecret \
+  --policy-name GracefulGutAI-SecretAccess \
   --policy-document file://infrastructure/lambda-execution-secrets-policy.json
 ```
+
+**The policy name changed on 2026-07-30, and the old one is not a synonym.**
+This command said `--policy-name GracefulGutAI-ReadApiKeySecret` until then. The
+first successful Phase 1G execution-role audit found the deployed role carrying
+its secret grant under `GracefulGutAI-SecretAccess` instead — correct in every
+other respect, scoped to the one expected secret and granting nothing else.
+`GracefulGutAI-ReadApiKeySecret` was only ever an instruction in this repository
+and never a record of a run; no evidence here shows it was applied.
+
+The name here was corrected to match what is deployed. Nothing in AWS was
+renamed, and nothing should be: running the old command now would add a *second*
+inline policy beside the working one rather than replace it.
 
 Substitute both placeholders first. The secret itself is created separately,
 also by an administrator; the exact commands are in CLAUDE.md under

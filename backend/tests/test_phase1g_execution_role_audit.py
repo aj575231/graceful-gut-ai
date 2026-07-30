@@ -433,10 +433,16 @@ def test_arns_are_masked_before_bare_account_ids() -> None:
 
 
 def test_findings_and_errors_pass_through_the_masker() -> None:
-    finding = AUDIT_CODE[AUDIT_CODE.index("function Write-Finding") :]
+    # Write-Classification is the single printer the four writers delegate to, so
+    # masking there covers every classified line. Write-Detail prints on its own
+    # and is checked with it.
+    finding = AUDIT_CODE[AUDIT_CODE.index("function Write-Classification") :]
     finding = finding[: finding.index("function Write-Section")]
 
     assert "Hide-Sensitive" in finding, "finding text is printed unmasked"
+    detail = AUDIT_CODE[AUDIT_CODE.index("function Write-Detail") :]
+    detail = detail[: detail.index("function Write-Verdict")]
+    assert "Hide-Sensitive" in detail, "detail text is printed unmasked"
 
     stop = AUDIT_CODE[AUDIT_CODE.index("function Stop-Run") :]
     stop = stop[: stop.index("function Invoke-Native")]
@@ -637,10 +643,23 @@ def test_scalar_and_array_policy_fields_are_both_handled() -> None:
     assert "Write-Output -NoEnumerate @($Value)" in AUDIT_CODE
 
 
-def test_the_expected_inline_policy_name_is_the_documented_one() -> None:
-    """CLAUDE.md has an administrator create this inline policy with
-    put-role-policy, so its presence is expected rather than a deviation."""
-    assert "$ExpectedInlinePolicyName = 'GracefulGutAI-ReadApiKeySecret'" in AUDIT_CODE
+def test_the_expected_inline_policy_name_is_the_deployed_one() -> None:
+    """The role carries one inline policy and 'GracefulGutAI-SecretAccess' is its
+    name on the deployed role, established by the first successful live audit.
+
+    The script expected 'GracefulGutAI-ReadApiKeySecret' until that run. That
+    name is what the administrator *instructions* in CLAUDE.md, in
+    infrastructure/README.md, and in the Phase 1D report tell an administrator to
+    pass to put-role-policy -- an instruction, never a record of a run. Expecting
+    it made the audit flag the correct deployed policy as a deviation, so the
+    expectation moved to what is deployed. Nothing in AWS was renamed: the
+    deployed policy grants exactly the expected secret read and only its name was
+    undocumented.
+    """
+    assert "$ExpectedInlinePolicyName = 'GracefulGutAI-SecretAccess'" in AUDIT_CODE
+    assert "$ExpectedInlinePolicyName = 'GracefulGutAI-ReadApiKeySecret'" not in (
+        AUDIT_CODE
+    )
 
 
 def test_an_unexpected_inline_policy_is_flagged_for_review() -> None:
@@ -648,6 +667,35 @@ def test_an_unexpected_inline_policy_is_flagged_for_review() -> None:
     inline = inline[: inline.index("function Get-ActionCategory")]
 
     assert "not part of the documented setup" in inline
+
+
+def test_an_unexpected_inline_policy_is_recorded_and_not_merely_printed() -> None:
+    """The defect the first successful live audit exposed. The terminal reported
+    the unrecognised policy name as a REVIEW and the review file reported
+    ``Overall: PASS`` with ``REVIEW: 0``, because this branch printed a
+    classification without recording a finding.
+
+    Add-Finding is now the only way to emit a REVIEW, so the branch cannot print
+    one without the review file seeing it.
+    """
+    inline = AUDIT_CODE[AUDIT_CODE.index("function Get-InlinePolicyDocuments") :]
+    inline = inline[: inline.index("function Get-ActionCategory")]
+
+    # The name check is an if/else: the canonical name is a step, any other name
+    # is a recorded finding. Scoped to the branch, because the same function
+    # records a separate REVIEW earlier for a role with no inline policy at all.
+    branch = inline[
+        inline.index("$expected = ($policyName -eq $ExpectedInlinePolicyName)") :
+    ]
+
+    step = branch.index('Write-Step -Name "Resolved inline policy:')
+    recorded = branch.index("Add-Finding -Severity 'Review'")
+
+    assert step < recorded, "the expected-name branch is not the Write-Step one"
+    assert "not part of the documented setup" in branch[recorded:]
+    assert "Write-Classification" not in branch, (
+        "the branch prints a classification without recording it"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -868,7 +916,7 @@ def test_the_completion_flag_is_set_after_the_last_stage() -> None:
 
     permissions = main.index("$permissions = Test-PolicyStatements")
     flag = main.index("$script:StagesCompleted = $true")
-    write = main.index("New-ReviewFile -Trust")
+    write = main.index("New-ReviewFile -Permissions")
 
     assert permissions < flag < write
 
@@ -944,13 +992,174 @@ def test_the_three_classifications_are_each_produced_in_one_place() -> None:
 
 def test_severity_combination_is_worst_wins() -> None:
     combiner = AUDIT_CODE[AUDIT_CODE.index("function Get-WorstSeverity") :]
-    combiner = combiner[: combiner.index("function Write-Finding")]
+    combiner = combiner[: combiner.index("function Write-Classification")]
 
     assert "'Fail'" in combiner
     assert "'Review'" in combiner
     fail = combiner.index("-contains 'Fail'")
     review = combiner.index("-contains 'Review'")
     assert fail < review, "Review would mask a Fail"
+
+
+# ---------------------------------------------------------------------------
+# One finding collection -- the terminal and the review cannot disagree
+# ---------------------------------------------------------------------------
+#
+# The first successful live audit produced two artefacts about one run that did
+# not agree. The terminal classified an inline policy under an unrecognised name
+# as a REVIEW. The review file, generated seconds later by the same process,
+# said `**Overall: PASS**` and `REVIEW: 0`.
+#
+# Neither artefact was internally inconsistent, which is what made it bad: from
+# either one alone the run looked fine, and there was no way to tell which to
+# believe without having both. The cause was structural rather than a wrong
+# comparison -- findings lived in three places, and the renderer read two of
+# them. The rules below hold the structure that replaced it: one collection, one
+# way in, one computation of the verdict.
+
+
+def test_there_is_exactly_one_finding_collection() -> None:
+    """The three-way split is gone. $script:AuditFindings is the only place a
+    finding lives, and the trust stage's private list and the permission stage's
+    reassignment are both absent."""
+    assert "$script:AuditFindings = New-Object" in AUDIT_CODE
+    assert AUDIT_CODE.count("$script:AuditFindings = New-Object") == 1, (
+        "the finding collection is created more than once"
+    )
+    assert "PermissionFindings" not in AUDIT_CODE, (
+        "the permission stage still keeps its own finding list"
+    )
+
+    # It is never reassigned after startup. A stage that re-created it would
+    # discard every finding recorded by the stages before it -- which is exactly
+    # what the permission stage used to do.
+    assignments = re.findall(r"\$script:AuditFindings\s*=", AUDIT_CODE)
+    assert len(assignments) == 1, f"the collection is reassigned: {assignments}"
+
+
+def test_add_finding_is_the_only_way_to_produce_a_review_or_a_fail() -> None:
+    """Write-Classification is private by convention and Add-Finding is the only
+    caller that can pass a non-Pass severity. A stage cannot print a REVIEW the
+    review file has never heard of."""
+    callers = re.findall(
+        r"Write-Classification -Severity ('[A-Za-z]+'|\$\w+)", AUDIT_CODE
+    )
+
+    # Three call sites: Write-Step pins 'Pass', Add-Finding and Write-Verdict pass
+    # a variable that ValidateSet has already constrained.
+    assert sorted(callers) == ["$Severity", "$Severity", "'Pass'"], (
+        f"unexpected Write-Classification call sites: {callers}"
+    )
+
+    step = FUNCTION_BODIES["Write-Step"]
+    assert "Write-Classification -Severity 'Pass'" in step
+    assert "$Severity" not in step, "Write-Step can emit something other than PASS"
+
+
+def test_add_finding_records_and_prints_in_the_same_call() -> None:
+    """The two cannot come apart. A finding that was printed but not recorded is
+    the whole defect."""
+    body = FUNCTION_BODIES["Add-Finding"]
+
+    recorded = body.index("$script:AuditFindings.Add(")
+    printed = body.index("Write-Classification -Severity $Severity")
+
+    assert recorded < printed, "a finding is printed before it is recorded"
+
+
+def test_add_finding_cannot_record_a_pass() -> None:
+    """A findings table is for things an administrator has to decide about.
+    Recording passes there buries the entries that need one, and it is why the
+    per-category counts became plain numbers."""
+    body = FUNCTION_BODIES["Add-Finding"]
+    validate = body[body.index("ValidateSet") :]
+    validate = validate[: validate.index(")")]
+
+    assert "'Pass'" not in validate, "Add-Finding still accepts a Pass"
+    assert "'Review'" in validate
+    assert "'Fail'" in validate
+
+
+def test_every_finding_records_the_stage_it_came_from() -> None:
+    """So the review's Stages table is built from the findings rather than from a
+    second set of severities kept alongside them."""
+    body = FUNCTION_BODIES["Add-Finding"]
+
+    assert "Stage      = [string]$script:Stage" in body
+
+
+def test_the_overall_verdict_is_computed_in_exactly_one_place() -> None:
+    """Two computations of "the overall result" is how a terminal and a file
+    disagree even when both read correct data."""
+    assert "function Get-OverallSeverity" in AUDIT_CODE
+
+    callers = re.findall(r"=\s*Get-OverallSeverity", AUDIT_CODE)
+    assert len(callers) == 2, f"expected the verdict stage and the renderer: {callers}"
+
+    # And the old route is gone: nothing recombines per-stage severities by hand.
+    assert "Get-WorstSeverity -Severities @($trust.Severity" not in AUDIT_CODE
+
+
+def test_the_review_stage_table_is_built_from_the_finding_collection() -> None:
+    """Not from four hand-written rows, two of which were the constant PASS. The
+    inline-policy stage had no row at all, so its finding could not have shown up
+    here however the run went."""
+    assert "foreach ($stage in $AuditStages)" in REVIEW_BODY
+    assert "Get-StageSeverity -Stage ([string]$stage)" in REVIEW_BODY
+
+
+def test_the_declared_stages_are_the_stages_the_script_actually_runs() -> None:
+    """$AuditStages is matched against a finding's recorded Stage by string, so a
+    title that drifts from its Write-Section call silently scores that stage PASS
+    forever."""
+    declared = re.findall(
+        r"^\s+'([^']+)',?$",
+        AUDIT_CODE[AUDIT_CODE.index("$AuditStages = @(") :].split(")")[0],
+        re.MULTILINE,
+    )
+    announced = re.findall(r"Write-Section '([^']+)'", AUDIT_CODE)
+
+    assert declared, "no stages were parsed out of $AuditStages"
+
+    # Verdict and Review announce themselves but record nothing, so they are the
+    # only two sections allowed to be absent from the table.
+    assert announced == [*declared, "Verdict", "Review"], (
+        f"declared: {declared}\nannounced: {announced}"
+    )
+
+
+# --- The verdict-to-exit-code mapping --------------------------------------
+
+
+def test_only_a_fail_exits_two() -> None:
+    """PASS and REVIEW both completed the audit, so both exit 0. A REVIEW is a
+    request for an administrator's judgement, not a failed run, and giving it a
+    non-zero exit would make every future caller treat it as breakage."""
+    main = main_body(AUDIT_CODE)
+
+    assert "if ($overall -eq 'Fail') { $script:ExitCode = 2 }" in main
+    assert main.count("$script:ExitCode = 2") == 1
+    assert "'Review'" not in main[main.index("$script:ExitCode = 2") :]
+
+
+def test_the_exit_code_starts_at_zero_and_is_set_in_three_places_only() -> None:
+    codes = re.findall(r"\$script:ExitCode\s*=\s*(\d)", AUDIT_CODE)
+
+    assert codes == ["0", "2", "1"], f"unexpected exit-code assignments: {codes}"
+
+
+def test_an_incomplete_run_exits_one_and_writes_no_review() -> None:
+    """Exit 1 is reserved for a run that did not finish. It is set in the catch
+    block, which is reached before the review is ever written -- and the review is
+    independently gated on the completion flag."""
+    # The script body's catch, not one of the helpers' -- anchored past the main
+    # body so an earlier try/catch inside a function cannot be picked up.
+    main = main_body(AUDIT_CODE)
+    catch = main[main.index("catch {") :]
+
+    assert "$script:ExitCode = 1" in catch
+    assert "New-ReviewFile" not in catch, "the catch block writes a review"
+    assert "$script:StagesCompleted = $true" not in catch
 
 
 # ---------------------------------------------------------------------------
@@ -1288,7 +1497,7 @@ def test_the_model_reproduces_the_administrator_failure() -> None:
 def test_the_model_reproduces_the_scalar_case_directly() -> None:
     """The simplest form of the same defect: a one-element list of a scalar,
     which is exactly the shape of a single inline policy name."""
-    delivered = broken_get_as_array(["GracefulGutAI-ReadApiKeySecret"])
+    delivered = broken_get_as_array(["GracefulGutAI-SecretAccess"])
 
     assert not isinstance(delivered, list)
     with pytest.raises(AttributeError, match="'Count' cannot be found"):
@@ -1337,8 +1546,8 @@ def test_attached_policies_normalise_for_zero_one_and_many(
     ("label", "value", "expected"),
     [
         ("zero", None, 0),
-        ("one", ["GracefulGutAI-ReadApiKeySecret"], 1),
-        ("many", ["GracefulGutAI-ReadApiKeySecret", "SomethingElse"], 2),
+        ("one", ["GracefulGutAI-SecretAccess"], 1),
+        ("many", ["GracefulGutAI-SecretAccess", "SomethingElse"], 2),
     ],
 )
 def test_inline_policies_normalise_for_zero_one_and_many(
@@ -2198,7 +2407,14 @@ def test_the_configuration_stage_never_prints_or_writes_the_role_arn() -> None:
     stage = FUNCTION_BODIES["Get-FunctionRoleName"]
 
     for line in stage.splitlines():
-        if "Write-Host" in line or "Write-Finding" in line or "$lines.Add" in line:
+        emits = (
+            "Write-Host" in line
+            or "Write-Step" in line
+            or "Write-Detail" in line
+            or "Add-Finding" in line
+            or "$lines.Add" in line
+        )
+        if emits:
             assert "$roleArn" not in line, f"prints the role ARN: {line.strip()}"
 
     # It is used for exactly one thing: deriving the name.
@@ -2391,7 +2607,7 @@ def test_the_harness_asserts_every_aws_call_reached_the_fake_cli() -> None:
     counts = [
         int(value) for value in re.findall(r"ExpectedCalls\s*=\s*(\d+)", RUNTIME_CODE)
     ]
-    assert len(counts) == 6, f"expected six scenarios to assert a count, got {counts}"
+    assert len(counts) == 7, f"expected seven scenarios to assert a count, got {counts}"
     assert all(count > 0 for count in counts)
 
 
@@ -2453,7 +2669,11 @@ def test_the_harness_has_no_cleanup_outside_the_finally_block() -> None:
 
 # --- What the harness proves about the audit -------------------------------
 
-#: The six scenarios the task requires, keyed by the letter each is labelled with.
+#: The scenarios the task requires, keyed by the letter each is labelled with.
+#:
+#: G was added after the first successful live audit. The six before it all
+#: exercised paths where the terminal and the review file agreed, so none of them
+#: could have caught a finding that reached one and not the other.
 REQUIRED_SCENARIOS = {
     "A": "clean expected role",
     "B": "zero attached managed policies",
@@ -2461,6 +2681,7 @@ REQUIRED_SCENARIOS = {
     "D": "function configuration missing State",
     "E": "function configuration with a null Role",
     "F": "secret grant on every secret",
+    "G": "inline policy under an unrecognised name",
 }
 
 
@@ -2471,6 +2692,30 @@ def harness_scenario_names() -> list[str]:
     and its siblings at the top of the file are not mistaken for scenarios.
     """
     return re.findall(r"^\s+Name\s+=\s*'([^']+)'", RUNTIME_CODE, re.MULTILINE)
+
+
+def harness_scenario_blocks() -> dict[str, str]:
+    """Each scenario's declaration, keyed by its label.
+
+    Split on the ``$scenarios.Add(@{`` that opens every one, so a rule can be
+    applied to every scenario rather than to a literal line that happens to
+    repeat. Counting identical lines silently stops covering any scenario that
+    words its assertions differently.
+    """
+    blocks: dict[str, str] = {}
+
+    for chunk in RUNTIME_CODE.split("$scenarios.Add(@{")[1:]:
+        match = re.search(r"Name\s+=\s*'([^']+)'", chunk)
+        assert match, f"a scenario block has no Name: {chunk[:120]}"
+        blocks[match.group(1)] = chunk
+
+    return blocks
+
+
+def test_the_scenario_block_split_matches_the_declared_names() -> None:
+    """Guards the splitter itself: every rule driven off it would pass on air if
+    it silently found nothing."""
+    assert sorted(harness_scenario_blocks()) == sorted(harness_scenario_names())
 
 
 def test_the_harness_declares_exactly_the_required_scenarios() -> None:
@@ -2674,7 +2919,7 @@ def test_the_fixtures_keep_records_and_collections_distinct() -> None:
     # The attached-policy fixture is an array of named rows -- both sides of the
     # split in one payload.
     assert '[{"PolicyName":"AWSLambdaBasicExecutionRole"' in RUNTIME_TEXT
-    assert '["GracefulGutAI-ReadApiKeySecret"]' in RUNTIME_TEXT
+    assert '["GracefulGutAI-SecretAccess"]' in RUNTIME_TEXT
 
     # And the function configuration fixture is an object with named fields.
     assert '{`"State`":`"Active`",`"LastUpdateStatus`":' in RUNTIME_TEXT
@@ -2727,7 +2972,7 @@ def test_the_review_path_scan_is_not_vacuous() -> None:
     """Both halves must actually be found, or every rule below passes on air."""
     assert "$reviewLines" in REVIEW_BODY
     assert "WriteAllText" in REVIEW_BODY
-    assert "New-ReviewFile -Trust" in REVIEW_PATH
+    assert "New-ReviewFile -Permissions" in REVIEW_PATH
     assert len(REVIEW_BODY.splitlines()) > 40
 
 
@@ -2791,35 +3036,58 @@ def test_no_generic_list_is_wrapped_in_an_array_subexpression_in_the_review() ->
 
 
 def test_the_stage_results_are_normalised_before_anything_is_rendered() -> None:
-    """Requirement 6. Each collection arriving from a stage is turned into a
-    plain [object[]] once, at the top, and nothing downstream sees the original.
+    """Requirement 6. Each collection the renderer touches is turned into a plain
+    [object[]] once, at the top, and nothing downstream sees the original.
     """
-    for name, source in (
-        ("$policyRows", "$Policies"),
-        ("$trustFindings", "$Trust.Findings"),
-        ("$permissionFindings", "$Permissions.Findings"),
-    ):
-        pattern = (
-            re.escape(name) + r"\s*=\s*\[object\[\]\]" + re.escape(source) + r"\s*\}"
-        )
-        assert re.search(pattern, REVIEW_BODY), (
-            f"{name} is not normalised from {source} with an [object[]] cast"
-        )
-
-    assert (
-        "[object[]]$allFindings = $trustFindings + $permissionFindings" in REVIEW_BODY
+    pattern = r"\$policyRows\s*=\s*\[object\[\]\]" + re.escape("$Policies") + r"\s*\}"
+    assert re.search(pattern, REVIEW_BODY), (
+        "$policyRows is not normalised from $Policies with an [object[]] cast"
     )
+
+    # The findings are copied element by element out of the script-scoped generic
+    # List and handed on as a plain array, for the same 5.1 binding reason.
+    assert (
+        "foreach ($finding in $script:AuditFindings) { $findingList.Add($finding) }"
+        in (REVIEW_BODY)
+    )
+    assert "[object[]]$allFindings = $findingList.ToArray()" in REVIEW_BODY
+
+
+def test_the_renderer_takes_no_findings_verdict_or_severity_as_a_parameter() -> None:
+    """The defect behind the terminal/review disagreement. The renderer used to be
+    handed $Trust and $Permissions and to read .Findings and .Severity off them,
+    so a finding recorded by any other stage could not reach the file. It now
+    reads the one collection and calls the same two functions the terminal did.
+    """
+    # Cut at the first statement after the param block, not at the first ')' --
+    # that one closes [Parameter(...)] on the very first parameter and would make
+    # this rule pass without reading the signature at all.
+    signature = REVIEW_BODY[: REVIEW_BODY.index("if (-not $script:StagesCompleted)")]
+
+    assert signature.count("[Parameter(Mandatory = $true)]") == 4, (
+        f"the renderer signature is not the expected four parameters:\n{signature}"
+    )
+    for gone in ("$Trust", "$Verdict"):
+        assert gone not in signature, f"{gone} is still a renderer parameter"
+
+    assert "$Trust.Findings" not in REVIEW_BODY
+    assert "$Permissions.Findings" not in REVIEW_BODY
+    assert "$Permissions.Severity" not in REVIEW_BODY
+    assert "$overallSeverity = Get-OverallSeverity" in REVIEW_BODY
 
 
 def test_the_normalisers_handle_the_null_case_before_casting() -> None:
     """``[object[]]$null`` is $null, not an empty array, so the guard is what
-    makes the zero case behave. Same lesson as Get-AsArray."""
-    for name in ("$policyRows", "$trustFindings", "$permissionFindings"):
-        assert f"[object[]]{name} = @()" in REVIEW_BODY, (
-            f"{name} has no empty-array default"
-        )
+    makes the zero case behave. Same lesson as Get-AsArray.
 
-    assert REVIEW_BODY.count("if ($null -ne ") >= 3
+    Only $policyRows is cast from a parameter now, so it is the only one that can
+    be handed a $null. The findings come from a List this script owns, which is
+    created at startup and never reassigned, so it cannot be null to begin with.
+    """
+    assert "[object[]]$policyRows = @()" in REVIEW_BODY, (
+        "$policyRows has no empty-array default"
+    )
+    assert "if ($null -ne $Policies)" in REVIEW_BODY
 
 
 def test_the_ordered_dictionary_is_no_longer_indexed_in_the_review() -> None:
@@ -2988,17 +3256,29 @@ def test_the_harness_surfaces_and_checks_the_child_diagnostic() -> None:
 
 
 def test_the_completed_scenarios_require_no_diagnostic_at_all() -> None:
-    """The regression guard for this failure. A, B, C, and F reached correct
-    verdicts and then died in review generation; if that recurs they will print a
-    diagnostic, and printing one is now a scenario failure."""
-    completed = re.findall(
-        r"MustNotContain = @\('Audit did not complete', 'DIAGNOSTIC:'\)", RUNTIME_CODE
-    )
+    """The regression guard for this failure. A, B, C, F, and G reach correct
+    verdicts and must then finish; the earlier runs reached correct verdicts and
+    died in review generation, and if that recurs they print a diagnostic.
 
-    assert len(completed) == 4, (
-        "expected the four completed scenarios to reject a diagnostic, "
-        f"found {len(completed)}"
-    )
+    Driven off ``ExpectReview = $true`` rather than off a literal MustNotContain
+    line, so a scenario that lists more prohibited strings than the others -- as A
+    and G both do -- is still held to the rule.
+    """
+    completed = {
+        name: block
+        for name, block in harness_scenario_blocks().items()
+        if "ExpectReview   = $true" in block
+    }
+
+    assert len(completed) == 5, f"completed scenarios found: {sorted(completed)}"
+
+    for name, block in completed.items():
+        prohibited = block[block.index("MustNotContain") :]
+        prohibited = prohibited[: prohibited.index(")")]
+        assert "'DIAGNOSTIC:'" in prohibited, f"{name} tolerates a diagnostic"
+        assert "'Audit did not complete'" in prohibited, (
+            f"{name} tolerates an incomplete audit"
+        )
 
 
 def test_the_incomplete_scenarios_require_the_diagnostic() -> None:

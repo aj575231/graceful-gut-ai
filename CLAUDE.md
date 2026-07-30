@@ -382,12 +382,25 @@ aws secretsmanager create-secret \
 #    Substitute <AWS_ACCOUNT_ID> and <AWS_REGION> first.
 aws iam put-role-policy \
   --role-name GracefulGutAI-LambdaExecutionRole \
-  --policy-name GracefulGutAI-ReadApiKeySecret \
+  --policy-name GracefulGutAI-SecretAccess \
   --policy-document file://infrastructure/lambda-execution-secrets-policy.json
 ```
 
 Until both are done, a deployed function returns 503 on every gated route —
 correctly, since it cannot resolve a secret.
+
+**The inline policy is `GracefulGutAI-SecretAccess`.** This file said
+`GracefulGutAI-ReadApiKeySecret` until 2026-07-30, and that name is superseded
+rather than an alias. The first successful Phase 1G execution-role audit found
+the deployed role's secret grant under `GracefulGutAI-SecretAccess`, scoped to
+the one expected secret and granting nothing else — the policy was right and
+only its name was undocumented here. `GracefulGutAI-ReadApiKeySecret` appears in
+this repository only as an instruction, in this file, in
+`infrastructure/README.md`, and in the Phase 1D report; nothing records it being
+run. The documents were corrected to match AWS. **Do not rename the live policy
+to match the old text, and do not re-run the old command** — it would add a
+second inline policy beside the working one. `scripts/audit-lambda-execution-role.ps1`
+expects the deployed name and flags any other inline policy for review.
 
 ---
 
