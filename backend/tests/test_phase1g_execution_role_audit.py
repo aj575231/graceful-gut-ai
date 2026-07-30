@@ -468,11 +468,60 @@ def test_the_role_arn_is_never_printed() -> None:
 
 def test_environment_variables_are_never_fetched() -> None:
     """Stronger than masking them: the function configuration is queried
-    server-side for three fields, so Environment.Variables -- which carries
+    server-side for three named fields, so Environment.Variables -- which carries
     GG_API_SECRET_ID -- never enters the process."""
-    assert "'--query', '[State,LastUpdateStatus,Role]'" in AUDIT_CODE
+    assert (
+        "'--query', '{State:State,LastUpdateStatus:LastUpdateStatus,Role:Role}'"
+        in AUDIT_CODE
+    )
     assert "Environment.Variables" not in AUDIT_CODE
     assert "Environment" in AUDIT_FLAT  # the reasoning is recorded
+
+
+def test_asking_for_the_environment_is_refused_by_the_wrapper() -> None:
+    """The narrow query was previously a convention at one call site. It is now a
+    gate: a query naming Environment is refused before the process starts, so the
+    property survives someone editing that call site."""
+    assert "$ForbiddenQueryFields = @(" in AUDIT_CODE
+    fields = parse_list_literal("ForbiddenQueryFields")
+
+    assert set(fields) == {"Environment", "SecretString", "SecretBinary"}
+
+    wrapper = AUDIT_CODE[AUDIT_CODE.index("function Invoke-AwsRead") :]
+    wrapper = wrapper[: wrapper.index("function ConvertFrom-AwsJson")]
+
+    guard = wrapper.index("$ForbiddenQueryFields")
+    execute = wrapper.index("Invoke-Native -Command 'aws'")
+    assert guard < execute, "the query is inspected after the call is made"
+
+
+def test_the_configuration_read_cannot_omit_its_query() -> None:
+    """A --query is what keeps the response narrow, so calling the operation
+    without one has to fail rather than fall back to the whole record."""
+    required = parse_list_literal("QueryRequiredOperations")
+
+    assert "lambda:get-function-configuration" in required
+    assert "secretsmanager:describe-secret" in required
+
+    for pair in required:
+        assert pair in READ_ONLY_OPERATIONS, f"not an allow-listed read: {pair}"
+
+    wrapper = AUDIT_CODE[AUDIT_CODE.index("function Invoke-AwsRead") :]
+    wrapper = wrapper[: wrapper.index("function ConvertFrom-AwsJson")]
+    assert (
+        "$QueryRequiredOperations -contains $pair -and $null -eq $queryText" in wrapper
+    )
+
+
+def test_the_query_gate_reads_arguments_without_indexing_them() -> None:
+    """The gate must not reintroduce the mistake it guards. Walking the argument
+    list needs no length check and no index, so there is nothing to get wrong."""
+    wrapper = AUDIT_CODE[AUDIT_CODE.index("function Invoke-AwsRead") :]
+    wrapper = wrapper[: wrapper.index("function ConvertFrom-AwsJson")]
+
+    assert "foreach ($argument in $Arguments)" in wrapper
+    assert "$Arguments.Count" not in wrapper
+    assert not re.search(r"\$Arguments\[\d+\]", wrapper)
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +1008,7 @@ TRACKED_FILES = tracked_text_files()
 #: identifier rather than a credential. Changing that is not this task's call.
 PHASE1G_FILES = [
     REPO_ROOT / "scripts" / "audit-lambda-execution-role.ps1",
+    REPO_ROOT / "scripts" / "test-audit-lambda-execution-role-runtime.ps1",
     Path(__file__),
 ]
 
@@ -1105,17 +1155,58 @@ def ps_pipeline_return(value: object) -> object:
     return value
 
 
-def ps_write_output_no_enumerate(value: object) -> object:
-    """Model of ``Write-Output -NoEnumerate``: the collection crosses whole."""
-    return value
+class _PSObjectWrapper:
+    """Model of the ``[psobject]`` Windows PowerShell 5.1 wraps -NoEnumerate in.
+
+    The wrapper forwards property access to what it holds -- ``.Count`` on it
+    reads the inner collection's Count -- but ``@(...)`` cannot see through it and
+    collects it as a single item. That asymmetry is the whole of the second
+    administrator failure: the length check read a Count of one, not three.
+    """
+
+    def __init__(self, inner: object) -> None:
+        self.inner = inner
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<psobject {self.inner!r}>"
+
+
+def ps_write_output_no_enumerate(value: object, *, wraps: bool) -> object:
+    """Model of ``Write-Output -NoEnumerate``: the collection crosses whole.
+
+    ``wraps`` selects the host. Windows PowerShell 5.1 adds a [psobject]
+    wrapper; PowerShell 7 does not. Both are modelled because the script has to
+    be correct on both and this host cannot determine which it is running on --
+    there is no PowerShell interpreter here.
+    """
+    return _PSObjectWrapper(value) if wraps else value
+
+
+def ps_cast_object_array(value: object) -> object:
+    """Model of the ``[object[]]`` cast the call sites apply.
+
+    A PowerShell conversion unwraps a [psobject] before converting, so the cast
+    yields the underlying array on 5.1 and leaves a plain array untouched on 7.
+    A scalar becomes a one-element array, which is also correct.
+    """
+    if isinstance(value, _PSObjectWrapper):
+        value = value.inner
+    if isinstance(value, _Nothing):
+        return []
+    if isinstance(value, list):
+        return list(value)
+    return [value]
 
 
 def ps_count(value: object) -> int:
     """Model of ``.Count`` under ``Set-StrictMode -Version Latest``.
 
-    A real collection has Count. A scalar object does not, and reading it raises
-    the exact error the administrator saw.
+    A real collection has Count. A [psobject]-wrapped one forwards the property.
+    A scalar object has no Count at all, and reading it raises the exact error the
+    first administrator run saw.
     """
+    if isinstance(value, _PSObjectWrapper):
+        return ps_count(value.inner)
     if isinstance(value, list):
         return len(value)
     raise AttributeError("The property 'Count' cannot be found on this object.")
@@ -1128,16 +1219,38 @@ def broken_get_as_array(value: object) -> object:
     return ps_pipeline_return(ps_array_subexpression(value))
 
 
-def fixed_get_as_array(value: object) -> object:
+def fixed_get_as_array(value: object, *, wraps: bool = False) -> object:
     """The corrected normaliser: ``Write-Output -NoEnumerate @($Value)``."""
     if value is None:
-        return ps_write_output_no_enumerate([])
-    return ps_write_output_no_enumerate(ps_array_subexpression(value))
+        return ps_write_output_no_enumerate([], wraps=wraps)
+    return ps_write_output_no_enumerate(ps_array_subexpression(value), wraps=wraps)
 
 
-def call_site(value: object) -> object:
-    """The corrected call-site pattern: ``@(Get-AsArray -Value $x)``."""
-    return ps_array_subexpression(fixed_get_as_array(value))
+def uncast_call_site(value: object, *, wraps: bool) -> object:
+    """The previous call-site pattern: ``@(Get-AsArray -Value $x)``.
+
+    Correct on PowerShell 7 and wrong on Windows PowerShell 5.1, where the
+    [psobject] wrapper survives into the array subexpression.
+    """
+    return ps_array_subexpression(fixed_get_as_array(value, wraps=wraps))
+
+
+def call_site(value: object, *, wraps: bool = False) -> object:
+    """The corrected call-site pattern: ``@([object[]](Get-AsArray -Value $x))``."""
+    return ps_array_subexpression(
+        ps_cast_object_array(fixed_get_as_array(value, wraps=wraps))
+    )
+
+
+#: Both hosts the script must run on. The suite checks every normalisation
+#: against both, because the script is deployed to a Windows administrator's
+#: machine and this host cannot tell which one that will be.
+HOSTS = ((False, "PowerShell 7"), (True, "Windows PowerShell 5.1"))
+
+
+def counts_on_every_host(value: object) -> dict[str, int]:
+    """Length the corrected call-site pattern yields, per host."""
+    return {label: ps_count(call_site(value, wraps=wraps)) for wraps, label in HOSTS}
 
 
 # --- The model is able to detect the bug -----------------------------------
@@ -1216,7 +1329,8 @@ def test_wrapping_the_call_site_alone_cannot_fix_the_null_case() -> None:
 def test_attached_policies_normalise_for_zero_one_and_many(
     label: str, value: object, expected: int
 ) -> None:
-    assert ps_count(call_site(value)) == expected, f"attached policies: {label}"
+    for host, actual in counts_on_every_host(value).items():
+        assert actual == expected, f"attached policies: {label} on {host}"
 
 
 @pytest.mark.parametrize(
@@ -1230,7 +1344,8 @@ def test_attached_policies_normalise_for_zero_one_and_many(
 def test_inline_policies_normalise_for_zero_one_and_many(
     label: str, value: object, expected: int
 ) -> None:
-    assert ps_count(call_site(value)) == expected, f"inline policies: {label}"
+    for host, actual in counts_on_every_host(value).items():
+        assert actual == expected, f"inline policies: {label} on {host}"
 
 
 @pytest.mark.parametrize(
@@ -1253,7 +1368,8 @@ def test_statements_normalise_for_zero_one_and_many(
 ) -> None:
     """A single-statement policy is the common shape for the inline secret grant,
     and it is the shape that would be skipped entirely by unnormalised code."""
-    assert ps_count(call_site(value)) == expected, f"statements: {label}"
+    for host, actual in counts_on_every_host(value).items():
+        assert actual == expected, f"statements: {label} on {host}"
 
 
 @pytest.mark.parametrize(
@@ -1270,7 +1386,8 @@ def test_statements_normalise_for_zero_one_and_many(
 def test_action_normalises_as_scalar_and_as_array(
     label: str, value: object, expected: int
 ) -> None:
-    assert ps_count(call_site(value)) == expected, f"Action as {label}"
+    for host, actual in counts_on_every_host(value).items():
+        assert actual == expected, f"Action as {label} on {host}"
 
 
 @pytest.mark.parametrize(
@@ -1283,7 +1400,8 @@ def test_action_normalises_as_scalar_and_as_array(
 def test_resource_normalises_as_scalar_and_as_array(
     label: str, value: object, expected: int
 ) -> None:
-    assert ps_count(call_site(value)) == expected, f"Resource as {label}"
+    for host, actual in counts_on_every_host(value).items():
+        assert actual == expected, f"Resource as {label} on {host}"
 
 
 @pytest.mark.parametrize(
@@ -1298,7 +1416,8 @@ def test_principal_service_normalises_as_scalar_and_as_array(
 ) -> None:
     """The trust-policy check compares the service-principal count against one.
     A scalar Service would have made that comparison unreachable."""
-    assert ps_count(call_site(value)) == expected, f"Principal.Service as {label}"
+    for host, actual in counts_on_every_host(value).items():
+        assert actual == expected, f"Principal.Service as {label} on {host}"
 
 
 @pytest.mark.parametrize("count", [0, 1, 3])
@@ -1339,17 +1458,24 @@ def test_the_normaliser_handles_null_before_wrapping() -> None:
     assert null_branch < wrap
 
 
-def test_every_normaliser_call_site_is_wrapped() -> None:
-    """The second, independent layer. Either layer alone fixes the one-item case,
-    so a regression has to defeat both to reach an administrator."""
-    unwrapped = []
+def test_every_normaliser_call_site_is_wrapped_and_cast() -> None:
+    """The second, independent layer, in the only form that works on both hosts.
+
+    ``@(...)`` alone was the previous version. It fixes the one-item case on
+    PowerShell 7 and does not fix it on Windows PowerShell 5.1, where the
+    [psobject] wrapper -NoEnumerate adds survives into the array subexpression --
+    which is the shape the second administrator failure reported. The
+    ``[object[]]`` cast unwraps it, and is a no-op on a plain array, so the call
+    site stops depending on which host it runs on.
+    """
+    offenders = []
     for line in AUDIT_CODE.splitlines():
         if "Get-AsArray -Value" not in line:
             continue
-        if "@(Get-AsArray -Value" not in line:
-            unwrapped.append(line.strip())
+        if "@([object[]](Get-AsArray -Value" not in line:
+            offenders.append(line.strip())
 
-    assert not unwrapped, f"unwrapped normaliser call sites: {unwrapped}"
+    assert not offenders, f"call sites without the wrap-and-cast: {offenders}"
 
 
 def test_the_collection_returning_resolvers_are_wrapped_too() -> None:
@@ -1434,17 +1560,37 @@ def test_the_function_splitter_finds_the_scripts_functions() -> None:
     assert "Invoke-AwsRead" in FUNCTION_BODIES
     assert len(FUNCTION_BODIES) > 15
 
-    # The scoping this exists for: $pair is a normalised array in one function
-    # and a plain string in another.
-    assert "$pair = @(Get-AsArray" in FUNCTION_BODIES["Get-AttachedPolicyDocuments"]
+    # The scoping this exists for: a name reused across functions must resolve to
+    # its own function's assignment. $values is normalised in both places, so a
+    # whole-file search would happen to pass here -- and would report a false
+    # violation the moment the two differed, which is what the first version of
+    # this scan did with $pair.
+    assert "$values = @([object[]](Get-AsArray" in FUNCTION_BODIES["Test-TrustPolicy"]
+    assert "$values = @([object[]](Get-AsArray" in FUNCTION_BODIES["Get-ResourceScope"]
     assert '$pair = "${Service}:${Operation}"' in FUNCTION_BODIES["Invoke-AwsRead"]
+
+    # And the positional $values that stopped the second run is gone entirely.
+    assert "$values" not in FUNCTION_BODIES["Get-FunctionRoleName"]
 
 
 def test_the_count_receiver_scan_finds_the_known_usages() -> None:
-    """A scan that matched nothing would make the rule below vacuous."""
+    """A scan that matched nothing would make the rule below vacuous.
+
+    The floor is lower than it was before the fixed-record correction, and that is
+    the improvement rather than a regression: the function-configuration and
+    secret-metadata reads used to count fields to decide whether a response was
+    complete, and both now validate named properties instead. Four ``.Count``
+    usages were deleted because counting was the wrong question.
+    """
     receivers = count_receivers()
 
-    assert len(receivers) >= 15, f"only found {len(receivers)} .Count usages"
+    assert len(receivers) >= 12, f"only found {len(receivers)} .Count usages"
+
+    # The collection sites -- where a length genuinely is data -- must still be
+    # counted, so the rule below is not passing by having nothing left to check.
+    counted = {receiver for _, receiver in receivers}
+    for expected in ("$rows", "$names", "$actions", "$servicePrincipals"):
+        assert expected in counted, f"the scan lost sight of {expected}"
 
 
 def test_every_count_receiver_is_normalised_or_a_real_collection() -> None:
@@ -1538,3 +1684,994 @@ def test_the_fail_closed_behaviour_survived_the_fix() -> None:
     assert AUDIT_CODE.count("return 'PASS'") == 1
     # Never apply a correction.
     assert "An administrator applies these. This script never does." in AUDIT_TEXT
+
+
+# ---------------------------------------------------------------------------
+# The second administrator failure. The first correction moved Get-AsArray onto
+# `Write-Output -NoEnumerate`; the next run stopped with
+#
+#     The function configuration query returned fewer fields than expected.
+#
+# The root cause was a category error rather than a plumbing bug. The function
+# configuration is a fixed-shape record -- State, LastUpdateStatus, Role -- and
+# it was being requested as the positional list [State,LastUpdateStatus,Role]
+# and then validated by length. Length is not a property of a fixed record, so
+# the check was measuring the wrong thing; it read one where it wanted three
+# because the [psobject] wrapper made the three fields arrive nested inside a
+# single item.
+#
+# Two things follow, and this section pins both. Fixed-shape responses are now
+# requested as JMESPath multiselect hashes and read by field name, so no length
+# is involved anywhere. And the call sites that legitimately do handle
+# collections got the [object[]] cast above, because the wrapper was a real
+# defect there too -- it was simply not the one that produced the error message.
+# ---------------------------------------------------------------------------
+
+
+THREE_FIELD_RECORD = ["Active", "Successful", "arn-placeholder"]
+
+
+def test_the_model_reproduces_the_second_administrator_failure() -> None:
+    """The positional read, on the host the administrator was using.
+
+    Three fields were requested and three were returned. What the length check
+    saw was one, because ``@(...)`` collected the [psobject] wrapper as a single
+    item instead of seeing the array inside it. The old guard was
+    ``$values.Count -lt 3``, so this is exactly the reported abort.
+    """
+    delivered = uncast_call_site(THREE_FIELD_RECORD, wraps=True)
+
+    assert ps_count(delivered) == 1, "the failure needs a nested single item"
+    assert isinstance(delivered[0], _PSObjectWrapper), "the wrapper is the item"
+    assert delivered[0].inner == THREE_FIELD_RECORD, "the fields are one level down"
+    assert ps_count(delivered) < 3, "this is the abort the administrator saw"
+
+
+def test_the_same_positional_read_would_have_passed_on_the_other_host() -> None:
+    """Why this reached an administrator rather than a test. On PowerShell 7 the
+    identical code returns three fields and the length check passes, so the defect
+    is invisible on any host that does not add the wrapper."""
+    delivered = uncast_call_site(THREE_FIELD_RECORD, wraps=False)
+
+    assert ps_count(delivered) == 3
+
+
+def test_the_collection_call_sites_were_affected_by_the_wrapper_too() -> None:
+    """The error message named the function configuration, but the wrapper hit
+    every call site. With one attached policy the uncast pattern yields a count of
+    one -- the right number by accident -- whose single element is the whole list
+    rather than a policy. The audit would have inspected a nested array instead of
+    a policy, which is a wrong answer rather than a crash."""
+    one_policy = [{"PolicyName": "AWSLambdaBasicExecutionRole", "PolicyArn": "arn"}]
+
+    delivered = uncast_call_site(one_policy, wraps=True)
+
+    assert ps_count(delivered) == 1
+    assert isinstance(delivered[0], _PSObjectWrapper)
+    assert delivered[0].inner == one_policy, "the element is the list, not a policy"
+
+    # The corrected pattern hands back the policy itself, on both hosts.
+    for wraps, label in HOSTS:
+        rows = call_site(one_policy, wraps=wraps)
+        assert ps_count(rows) == 1, label
+        assert rows[0]["PolicyName"] == "AWSLambdaBasicExecutionRole", label
+
+
+@pytest.mark.parametrize(
+    ("label", "value", "expected"),
+    [
+        ("zero", None, 0),
+        ("one", [{"PolicyName": "A", "PolicyArn": "arn-a"}], 1),
+        (
+            "many",
+            [
+                {"PolicyName": "A", "PolicyArn": "arn-a"},
+                {"PolicyName": "B", "PolicyArn": "arn-b"},
+            ],
+            2,
+        ),
+    ],
+)
+def test_named_policy_rows_normalise_for_zero_one_and_many(
+    label: str, value: object, expected: int
+) -> None:
+    """The zero/one/many guarantee, restated for the named-row shape the attached
+    policy query now returns. The previous correction's property is preserved; only
+    the shape of each row changed."""
+    for host, actual in counts_on_every_host(value).items():
+        assert actual == expected, f"named policy rows: {label} on {host}"
+
+
+# --- A model of the fixed-record path, and of what it refuses ---------------
+
+
+class StopRun(Exception):
+    """Model of the script's Stop-Run: the whole audit aborts, no review."""
+
+
+def ps_convert_from_json_record(payload: object) -> dict:
+    """Model of ConvertFrom-AwsJsonRecord's guards.
+
+    A JSON object crosses as a named record. A list, a scalar, or nothing at all
+    stops the run -- a list in particular, because a list arriving here means some
+    call site went back to a positional query.
+    """
+    if payload is None:
+        raise StopRun("No record was returned.")
+    if isinstance(payload, (str, bool, int, float)):
+        raise StopRun("arrived as a single value where a named record was expected")
+    if isinstance(payload, list):
+        raise StopRun("arrived as a list where a single named record was expected")
+    return payload
+
+
+def get_required_field(record: dict, name: str) -> str:
+    """Model of Get-RequiredField: present, non-null, a string, and non-empty."""
+    if name not in record:
+        raise StopRun(f"did not include the required field '{name}'")
+    value = record[name]
+    if value is None:
+        raise StopRun(f"did not include the required field '{name}'")
+    if not isinstance(value, str):
+        raise StopRun(f"returned '{name}' as something other than a string")
+    if not value.strip():
+        raise StopRun(f"did not include the required field '{name}'")
+    return value
+
+
+CONFIGURATION_FIELDS = ("State", "LastUpdateStatus", "Role")
+
+CLEAN_CONFIGURATION = {
+    "State": "Active",
+    "LastUpdateStatus": "Successful",
+    "Role": f"arn:aws:iam::{sorted(PLACEHOLDER_ACCOUNT_IDS)[0]}:role/ExampleRole",
+}
+
+
+def test_the_configuration_is_read_as_a_named_record() -> None:
+    """No length, no index. Each field is fetched by the name it was asked for."""
+    record = ps_convert_from_json_record(dict(CLEAN_CONFIGURATION))
+
+    assert get_required_field(record, "State") == "Active"
+    assert get_required_field(record, "LastUpdateStatus") == "Successful"
+    assert get_required_field(record, "Role").endswith("/ExampleRole")
+
+
+def test_a_named_record_is_immune_to_the_wrapper_that_broke_the_positional_read() -> (
+    None
+):
+    """The point of the correction. A JSON object has no elements, so there is
+    nothing for -NoEnumerate to wrap, nothing for the pipeline to enumerate, and
+    no position for a field to move to -- on either host."""
+    record = ps_convert_from_json_record(dict(CLEAN_CONFIGURATION))
+
+    for wraps, label in HOSTS:
+        delivered = fixed_get_as_array(record, wraps=wraps)
+        # Even routed through the collection normaliser it stays one record, and
+        # its fields are still reachable by name.
+        recovered = ps_cast_object_array(delivered)
+        assert len(recovered) == 1, label
+        assert get_required_field(recovered[0], "State") == "Active", label
+
+
+@pytest.mark.parametrize("missing", CONFIGURATION_FIELDS)
+def test_an_absent_configuration_field_fails_and_names_itself(missing: str) -> None:
+    """Requirement: missing State fails, missing LastUpdateStatus fails, missing
+    Role fails -- and the message says which. The length check said the same
+    sentence for all three, which is why the administrator could not tell what was
+    wrong from the output."""
+    record = {k: v for k, v in CLEAN_CONFIGURATION.items() if k != missing}
+
+    with pytest.raises(StopRun) as raised:
+        for field in CONFIGURATION_FIELDS:
+            get_required_field(ps_convert_from_json_record(record), field)
+
+    assert f"'{missing}'" in str(raised.value)
+
+
+@pytest.mark.parametrize("nulled", CONFIGURATION_FIELDS)
+def test_a_null_configuration_field_fails_like_an_absent_one(nulled: str) -> None:
+    """A JMESPath query for a field the response does not carry returns JSON null
+    rather than omitting the key, so present-but-null has to fail too. Both mean
+    the audit does not know the value."""
+    record = dict(CLEAN_CONFIGURATION)
+    record[nulled] = None
+
+    with pytest.raises(StopRun) as raised:
+        for field in CONFIGURATION_FIELDS:
+            get_required_field(ps_convert_from_json_record(record), field)
+
+    assert f"'{nulled}'" in str(raised.value)
+
+
+@pytest.mark.parametrize("bad", ["", "   "])
+def test_an_empty_configuration_field_fails(bad: str) -> None:
+    record = dict(CLEAN_CONFIGURATION)
+    record["State"] = bad
+
+    with pytest.raises(StopRun):
+        get_required_field(ps_convert_from_json_record(record), "State")
+
+
+def test_a_non_string_configuration_field_fails() -> None:
+    """A field that arrives as a number or an object is not a state name, and
+    coercing it would produce a comparison against a string that never matches."""
+    record = dict(CLEAN_CONFIGURATION)
+    record["State"] = {"Nested": "Active"}
+
+    with pytest.raises(StopRun, match="other than a string"):
+        get_required_field(ps_convert_from_json_record(record), "State")
+
+
+def test_the_three_fields_are_validated_independently() -> None:
+    """Independence is what the length check could not offer. A response carrying
+    State and Role but not LastUpdateStatus has three keys' worth of positions and
+    would have passed a length check while leaving one value empty."""
+    record = dict(CLEAN_CONFIGURATION)
+    record["LastUpdateStatus"] = None
+
+    # State still reads fine -- the failure is specific to the field that is wrong.
+    assert get_required_field(ps_convert_from_json_record(record), "State") == "Active"
+    assert get_required_field(ps_convert_from_json_record(record), "Role")
+
+    with pytest.raises(StopRun, match="LastUpdateStatus"):
+        get_required_field(ps_convert_from_json_record(record), "LastUpdateStatus")
+
+
+def test_the_old_positional_read_could_not_have_caught_that() -> None:
+    """The same response, read positionally: three items arrive, the length check
+    passes, and the empty middle field is cast to a string and compared. The audit
+    would have reported "last update was not Successful" for a response that never
+    said so."""
+    positional = ["Active", None, "arn-placeholder"]
+
+    assert ps_count(ps_array_subexpression(positional)) == 3, "length check passes"
+    assert positional[1] is None, "and the field it needed is absent anyway"
+
+
+def test_a_positional_response_is_refused_by_the_record_parser() -> None:
+    """The guard that stops the mistake coming back. A call site edited back to
+    '[Field,Field]' fails immediately rather than being indexed."""
+    with pytest.raises(StopRun, match="arrived as a list"):
+        ps_convert_from_json_record(THREE_FIELD_RECORD)
+
+
+def test_a_bare_scalar_response_is_refused_by_the_record_parser() -> None:
+    """'--output text' with a single-field query returns a bare value. It is not a
+    record, and treating it as one would make every field read return nothing."""
+    with pytest.raises(StopRun, match="single value"):
+        ps_convert_from_json_record("Active")
+
+
+# --- The script actually asks for named fields everywhere ------------------
+
+#: Every fixed-shape read, with the multiselect hash it must request. Read as a
+#: table so a new fixed-shape call cannot be added positionally without either
+#: appearing here or failing the sweep below.
+FIXED_RECORD_QUERIES = {
+    "sts:get-caller-identity": "{Account:Account}",
+    "lambda:get-function-configuration": (
+        "{State:State,LastUpdateStatus:LastUpdateStatus,Role:Role}"
+    ),
+    "secretsmanager:describe-secret": "{Arn:ARN,KmsKeyId:KmsKeyId}",
+    "iam:get-role": "{AssumeRolePolicyDocument:Role.AssumeRolePolicyDocument}",
+    "iam:get-policy": "{DefaultVersionId:Policy.DefaultVersionId}",
+    "iam:get-policy-version": "{Document:PolicyVersion.Document}",
+    "iam:get-role-policy": "{PolicyDocument:PolicyDocument}",
+}
+
+#: The two genuine collections. Their length is data, so they are queried as
+#: lists on purpose and normalised rather than validated by name.
+COLLECTION_QUERIES = {
+    "iam:list-attached-role-policies": (
+        "AttachedPolicies[].{PolicyName:PolicyName,PolicyArn:PolicyArn}"
+    ),
+    "iam:list-role-policies": "PolicyNames",
+}
+
+
+@pytest.mark.parametrize(("pair", "query"), sorted(FIXED_RECORD_QUERIES.items()))
+def test_every_fixed_record_read_asks_for_named_fields(pair: str, query: str) -> None:
+    assert f"'--query', '{query}'" in AUDIT_CODE, f"{pair} does not ask by name"
+
+
+def test_the_two_collection_reads_are_still_queried_as_collections() -> None:
+    """The split has two sides and both must hold. Turning a list into a
+    multiselect hash would lose the zero/one/many property the previous correction
+    bought."""
+    for pair, query in COLLECTION_QUERIES.items():
+        assert f"'--query', '{query}'" in AUDIT_CODE, f"{pair} query changed"
+
+
+def test_the_fixed_record_table_covers_every_non_collection_read() -> None:
+    """A table that omitted a read would let that read stay positional."""
+    covered = set(FIXED_RECORD_QUERIES) | set(COLLECTION_QUERIES)
+
+    assert covered == set(READ_ONLY_OPERATIONS), (
+        "a read is neither classified as a fixed record nor as a collection"
+    )
+
+
+def test_no_positional_multiselect_query_survives_anywhere() -> None:
+    """The shape that broke the run, banned by construction. A JMESPath
+    multiselect *list* is '[A,B]'; a hash is '{A:A,B:B}'. Only the hash is
+    allowed, except inside the one collection projection that needs a list index.
+    """
+    offenders = re.findall(r"'--query',\s*'\[[^']*'", AUDIT_CODE)
+
+    assert not offenders, f"positional multiselect queries: {offenders}"
+
+
+def test_no_fixed_record_read_uses_text_output() -> None:
+    """'--output text' returns a bare value with no field names in it, so a text
+    read cannot be validated by name. Both former text reads -- the caller identity
+    and the default policy version -- are JSON now."""
+    assert "'--output', 'text'" not in AUDIT_CODE
+
+    for query in FIXED_RECORD_QUERIES.values():
+        index = AUDIT_CODE.index(f"'--query', '{query}'")
+        following = AUDIT_CODE[index : index + 200]
+        assert "'--output', 'json'" in following, f"{query} is not read as JSON"
+
+
+def test_the_configuration_stage_has_no_length_or_index_logic_left() -> None:
+    """Requirement: no positional field-count logic for the function
+    configuration. The stage is checked as a whole rather than by grepping for the
+    old lines, so an equivalent rewrite cannot slip back in."""
+    stage = FUNCTION_BODIES["Get-FunctionRoleName"]
+
+    assert ".Count" not in stage, "the configuration stage counts something again"
+    assert not re.search(r"\$[A-Za-z_][A-Za-z0-9_]*\[\d+\]", stage), (
+        "the configuration stage indexes by position again"
+    )
+    assert "Get-AsArray" not in stage, (
+        "a fixed record is going through the collection normaliser again"
+    )
+
+
+def test_the_old_field_count_message_is_gone() -> None:
+    """The message an administrator saw. Its absence is how a rerun proves it is
+    running the corrected script."""
+    # The comment-stripped copy: the doc block quotes the old message on purpose,
+    # to record what an administrator saw and why it was the wrong question.
+    assert "returned fewer fields than expected" not in AUDIT_CODE
+    assert "returned fewer fields than expected" in AUDIT_TEXT, (
+        "the failure this fix addresses is no longer recorded in the script"
+    )
+
+
+def test_the_secret_metadata_stage_has_no_index_logic_left() -> None:
+    """describe-secret was read positionally by the same pattern and would have
+    failed the same way. Named fields there too, with KmsKeyId optional because a
+    null KmsKeyId is a real answer."""
+    stage = FUNCTION_BODIES["Get-ExpectedSecret"]
+
+    assert not re.search(r"\$[A-Za-z_][A-Za-z0-9_]*\[\d+\]", stage)
+    assert "Get-RequiredField -Record $metadata -Name 'Arn'" in stage
+    assert "Get-OptionalField -Record $metadata -Name 'KmsKeyId'" in stage
+
+
+def test_each_configuration_field_has_its_own_validation_call() -> None:
+    """Three separate calls, so three separate messages. One call reading three
+    fields would collapse the diagnostic again."""
+    stage = FUNCTION_BODIES["Get-FunctionRoleName"]
+
+    for field in CONFIGURATION_FIELDS:
+        assert f"Get-RequiredField -Record $configuration -Name '{field}'" in stage, (
+            f"{field} is not validated on its own"
+        )
+
+
+def test_the_required_field_reader_rejects_every_unusable_value() -> None:
+    """Absent, null, non-string, and empty all have to fail, and the script's own
+    helper is the single place that decides so."""
+    helper = AUDIT_CODE[AUDIT_CODE.index("function Get-RequiredField") :]
+    helper = helper[: helper.index("function Get-OptionalField")]
+
+    assert "Test-HasProperty -Object $Record -Name $Name" in helper
+    assert "$null -eq $value" in helper
+    assert "$value -isnot [string]" in helper
+    assert "[string]::IsNullOrWhiteSpace($value)" in helper
+    assert helper.count("Stop-Run") == 4, "a rejection path stopped stopping the run"
+
+
+def test_the_record_parser_rejects_lists_scalars_and_nothing() -> None:
+    parser = AUDIT_CODE[AUDIT_CODE.index("function ConvertFrom-AwsJsonRecord") :]
+    parser = parser[: parser.index("function Get-RequiredField")]
+
+    assert "$parsed -is [string] -or $parsed -is [System.ValueType]" in parser
+    assert "$parsed -is [System.Collections.IEnumerable]" in parser
+    assert "$null -eq $parsed" in parser
+
+    # A string is an IEnumerable, so it has to be rejected as a scalar first or the
+    # message would call it a list.
+    assert parser.index("-is [string]") < parser.index("IEnumerable")
+
+
+def test_the_record_parser_does_not_use_the_pipeline() -> None:
+    """The pipeline is the mechanism that unwraps collections. A record parser
+    that used it would be depending on the behaviour it exists to avoid."""
+    parser = AUDIT_CODE[AUDIT_CODE.index("function ConvertFrom-AwsJsonRecord") :]
+    parser = parser[: parser.index("function Get-RequiredField")]
+
+    assert "ConvertFrom-Json -InputObject $Text" in parser
+    assert "| ConvertFrom-Json" not in parser
+
+
+def test_the_two_parsers_are_kept_separate() -> None:
+    """One parser for records, one for collections, and no call site using the
+    wrong one. This is the separation the correction is built on."""
+    assert "function ConvertFrom-AwsJsonList" in AUDIT_CODE
+    assert "function ConvertFrom-AwsJsonRecord" in AUDIT_CODE
+
+    # The list parser is used only where a length is genuinely data.
+    list_uses = re.findall(r"ConvertFrom-AwsJsonList -Text \$\w+\.Output", AUDIT_CODE)
+    assert len(list_uses) == 2, f"expected two collection reads, found {len(list_uses)}"
+
+    # Every list parse is normalised; none is read by field name.
+    for line in AUDIT_CODE.splitlines():
+        if "ConvertFrom-AwsJsonList" not in line or "function" in line:
+            continue
+        assert "Get-AsArray" in line, (
+            f"a collection read is not normalised: {line.strip()}"
+        )
+
+
+# --- The role ARN is reduced to a name and never emitted --------------------
+
+
+def script_role_arn_pattern() -> re.Pattern[str]:
+    """The script's own role-ARN regex, translated to Python.
+
+    Read from the script rather than restated, so this cannot pass against a
+    pattern the script does not use. Only the named-group syntax differs.
+    """
+    helper = AUDIT_TEXT[AUDIT_TEXT.index("function Get-RoleNameFromArn") :]
+    helper = helper[: helper.index("function Get-AsArray")]
+
+    match = re.search(r"\$Arn,\s*'([^']+)'\)", helper)
+    assert match, "the role-ARN pattern is not where this test expects it"
+
+    return re.compile(match.group(1).replace("(?<name>", "(?P<name>"))
+
+
+ROLE_ARN_PATTERN = script_role_arn_pattern()
+
+
+def test_the_role_name_is_extracted_from_a_plain_role_arn() -> None:
+    account = sorted(PLACEHOLDER_ACCOUNT_IDS)[0]
+    match = ROLE_ARN_PATTERN.match(f"arn:aws:iam::{account}:role/ExampleRole")
+
+    assert match and match.group("name") == "ExampleRole"
+
+
+def test_the_role_name_is_the_last_segment_of_a_pathed_role_arn() -> None:
+    """A pathed role is 'role/path/to/Name'. Taking the segment after 'role/'
+    would return the path element instead of the name."""
+    account = sorted(PLACEHOLDER_ACCOUNT_IDS)[0]
+    match = ROLE_ARN_PATTERN.match(
+        f"arn:aws:iam::{account}:role/service-role/deeper/ExampleRole"
+    )
+
+    assert match and match.group("name") == "ExampleRole"
+
+
+@pytest.mark.parametrize(
+    "arn",
+    [
+        "not-an-arn",
+        "arn:aws:iam::123456789012:user/Someone",
+        "arn:aws:lambda:us-east-2:123456789012:function:f",
+        "arn:aws:iam::12345:role/TooShortAccount",
+        "",
+    ],
+)
+def test_a_value_that_is_not_a_role_arn_is_rejected(arn: str) -> None:
+    assert not ROLE_ARN_PATTERN.match(arn)
+
+
+def test_the_role_extraction_never_puts_the_value_in_its_message() -> None:
+    """The ARN carries the account ID, so a failure message quoting the value
+    would leak it to the terminal on exactly the run that went wrong."""
+    helper = AUDIT_CODE[AUDIT_CODE.index("function Get-RoleNameFromArn") :]
+    helper = helper[: helper.index("function Get-AsArray")]
+
+    for line in helper.splitlines():
+        if "Stop-Run" not in line:
+            continue
+        assert "$Arn" not in line, (
+            f"the failure message carries the ARN: {line.strip()}"
+        )
+
+
+def test_the_configuration_stage_never_prints_or_writes_the_role_arn() -> None:
+    stage = FUNCTION_BODIES["Get-FunctionRoleName"]
+
+    for line in stage.splitlines():
+        if "Write-Host" in line or "Write-Finding" in line or "$lines.Add" in line:
+            assert "$roleArn" not in line, f"prints the role ARN: {line.strip()}"
+
+    # It is used for exactly one thing: deriving the name.
+    uses = [line for line in stage.splitlines() if "$roleArn" in line]
+    assert len(uses) == 2, f"unexpected uses of the role ARN: {uses}"
+
+
+def test_no_secret_value_can_enter_the_process() -> None:
+    """Three independent controls, all of which must be present: the read is
+    forbidden by name, it is absent from the allow-list, and no query may name the
+    payload fields even on an allow-listed call."""
+    for operation in ("get-secret-value", "batch-get-secret-value"):
+        assert f"secretsmanager:{operation}" in FORBIDDEN_OPERATIONS
+        assert f"secretsmanager:{operation}" not in READ_ONLY_OPERATIONS
+
+    fields = parse_list_literal("ForbiddenQueryFields")
+    assert "SecretString" in fields
+    assert "SecretBinary" in fields
+
+    # describe-secret returns metadata only, and only two named fields are asked
+    # for. Neither is the value.
+    assert "'--query', '{Arn:ARN,KmsKeyId:KmsKeyId}'" in AUDIT_CODE
+    assert "SecretString" not in AUDIT_CODE.replace("'SecretString',", "")
+
+
+# ---------------------------------------------------------------------------
+# The runtime fixture harness.
+#
+# Everything above is a static read. That is what it can be: this host has no
+# PowerShell interpreter, so no test here can prove the script *behaves*. Both
+# administrator failures were behavioural, and both got as far as a live IAM
+# audit before anyone saw them.
+#
+# scripts/test-audit-lambda-execution-role-runtime.ps1 is the missing half. It
+# runs the real audit, on the administrator's own PowerShell, against a fake AWS
+# CLI and deterministic fixtures. This section cannot run it either -- what it can
+# do, and does, is prove the harness is isolated: that it cannot reach the real
+# AWS CLI, cannot read a secret, cannot write into the checkout, and cannot leave
+# its sandbox behind.
+# ---------------------------------------------------------------------------
+
+RUNTIME = REPO_ROOT / "scripts" / "test-audit-lambda-execution-role-runtime.ps1"
+RUNTIME_TEXT = RUNTIME.read_text(encoding="utf-8")
+RUNTIME_CODE = executable_lines(RUNTIME_TEXT)
+RUNTIME_FLAT = normalise(RUNTIME_TEXT)
+
+#: The shim's body, read out of the here-string it is stored in.
+FAKE_CLI = re.search(r"\$FakeAwsShim = @'\n(.*?)\n'@", RUNTIME_TEXT, re.DOTALL)
+
+
+def runtime_list_literal(name: str) -> list[str]:
+    match = re.search(
+        r"\$" + re.escape(name) + r"\s*=\s*@\((.*?)\n\)", RUNTIME_TEXT, re.DOTALL
+    )
+    assert match, f"${name} not found in the harness"
+    return re.findall(r"'([^']+)'", match.group(1))
+
+
+def test_the_runtime_harness_exists_and_is_substantial() -> None:
+    assert RUNTIME.exists(), "the runtime harness is missing"
+    assert len(RUNTIME_CODE.splitlines()) > 200
+
+
+def test_the_harness_runs_under_strict_mode_on_both_hosts() -> None:
+    """The harness has to be at least as strict as what it tests, and it has to
+    run where the administrator is. A harness that only worked on PowerShell 7
+    would have passed both failures this exists to catch."""
+    assert "Set-StrictMode -Version Latest" in RUNTIME_CODE
+    assert "Windows PowerShell 5.1 and PowerShell 7" in RUNTIME_FLAT
+
+
+def test_the_harness_explains_why_erroractionpreference_is_not_stop() -> None:
+    assert "NativeCommandError" in RUNTIME_TEXT
+
+
+# --- Isolation: it cannot reach the real AWS CLI ----------------------------
+
+
+def test_the_harness_writes_a_fake_cli_and_puts_it_first_on_path() -> None:
+    """This is the isolation mechanism, and it is the whole basis of the claim
+    that no AWS call is made: `aws` is resolved through PATH, so a fake `aws`
+    ahead of everything else is what the audit finds."""
+    assert "$FakeAwsShim" in RUNTIME_CODE
+    assert "'aws.cmd'" in RUNTIME_CODE
+    assert "Set-ProcessEnvironment -Name 'PATH'" in RUNTIME_CODE
+
+    # Prepended, not appended: appending would let a real aws win.
+    prepend = re.search(
+        r"Set-ProcessEnvironment -Name 'PATH' -Value \(\$binDir \+", RUNTIME_CODE
+    )
+    assert prepend, "the fake CLI directory is not prepended to PATH"
+
+
+def test_the_harness_never_invokes_a_real_aws_executable() -> None:
+    """The harness itself must not call aws. The only thing it runs is the audit
+    script, as a child process, and the audit reaches the fake CLI through PATH."""
+    assert "Invoke-Native" not in RUNTIME_CODE
+    assert "aws.exe" not in RUNTIME_TEXT
+    assert not re.search(r"&\s*'?aws'?\s", RUNTIME_CODE)
+
+    invocations = re.findall(r"^\s*\$captured = & (\S+)", RUNTIME_CODE, re.MULTILINE)
+    assert invocations == ["$HostPath"], (
+        f"the harness runs something other than a PowerShell host: {invocations}"
+    )
+
+
+def test_the_harness_clears_aws_credentials_for_the_child() -> None:
+    """Belt and braces. If some path this harness did not anticipate reached a real
+    CLI, it would find no credentials, no profile, no config file, and no instance
+    metadata to fall back on."""
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+    ):
+        assert f"Set-ProcessEnvironment -Name '{name}' -Value ''" in RUNTIME_CODE, (
+            f"{name} is not cleared"
+        )
+
+    assert "-Name 'AWS_EC2_METADATA_DISABLED' -Value 'true'" in RUNTIME_CODE
+    assert "'no-such-aws-config'" in RUNTIME_CODE
+    assert "'no-such-aws-credentials'" in RUNTIME_CODE
+
+
+def test_every_environment_variable_the_harness_touches_is_restored() -> None:
+    """A harness that leaked a modified PATH or TEMP into the administrator's
+    session would be a worse problem than the bug it found."""
+    touched = set(runtime_list_literal("environmentNames"))
+
+    assigned = set(
+        re.findall(r"Set-ProcessEnvironment -Name '([A-Z_]+)'", RUNTIME_CODE)
+    )
+    unmanaged = assigned - touched
+    assert not unmanaged, f"changed but never restored: {sorted(unmanaged)}"
+
+    assert "PATH" in touched
+    assert "TEMP" in touched
+    restore = RUNTIME_CODE[RUNTIME_CODE.index("finally {") :]
+    assert "foreach ($name in $environmentNames)" in restore
+
+
+def test_the_fake_cli_refuses_both_secret_read_operations() -> None:
+    """The audit refuses these before starting a process. The fake CLI refuses them
+    again and records the attempt, so a run that somehow tried is visible in the
+    harness output rather than being merely improbable."""
+    assert FAKE_CLI, "the fake CLI body is not where this test expects it"
+    shim = FAKE_CLI.group(1)
+
+    assert 'if /I "%OPERATION%"=="get-secret-value" goto breach' in shim
+    assert 'if /I "%OPERATION%"=="batch-get-secret-value" goto breach' in shim
+    assert "exit /b 254" in shim
+
+    # And the harness fails the run if the breach log ever appears.
+    assert "a secret-value read was attempted" in RUNTIME_TEXT
+
+
+def test_the_fake_cli_never_reads_the_query_it_was_given() -> None:
+    """cmd.exe splits arguments on commas, so a shim that parsed the JMESPath query
+    would be depending on tokenisation this harness cannot control. It stops at the
+    service and the operation, which contain no delimiter."""
+    assert FAKE_CLI
+    shim = FAKE_CLI.group(1)
+
+    assert "--query" not in shim
+    assert "%*" not in shim, "forwarding the whole command line reintroduces the risk"
+    assert "goto ready" in shim
+
+
+def test_the_fake_cli_fails_closed_on_an_unexpected_call() -> None:
+    """A call with no fixture must fail rather than return an empty document that
+    the audit would parse as a policy with no statements."""
+    assert FAKE_CLI
+    shim = FAKE_CLI.group(1)
+
+    assert "goto nofixture" in shim
+    assert "exit /b 253" in shim
+    assert "exit /b 252" in shim
+
+
+def test_the_harness_asserts_every_aws_call_reached_the_fake_cli() -> None:
+    """The strongest isolation statement the harness can make: each scenario knows
+    exactly how many calls the audit should make, and a call that resolved to
+    anything else would leave the log short."""
+    assert "GG_FAKE_AWS_CALLLOG" in RUNTIME_CODE
+    assert "ExpectedCalls" in RUNTIME_CODE
+    assert "fake-CLI calls, logged" in RUNTIME_TEXT
+
+    counts = [
+        int(value) for value in re.findall(r"ExpectedCalls\s*=\s*(\d+)", RUNTIME_CODE)
+    ]
+    assert len(counts) == 6, f"expected six scenarios to assert a count, got {counts}"
+    assert all(count > 0 for count in counts)
+
+
+# --- Isolation: it writes nothing into the repository -----------------------
+
+
+def test_the_sandbox_is_created_under_the_system_temp_directory() -> None:
+    assert "[System.IO.Path]::GetTempPath()" in RUNTIME_CODE
+    assert "gg-phase1g-runtime-" in RUNTIME_CODE
+    assert "[System.Guid]::NewGuid()" in RUNTIME_CODE
+
+
+def test_the_sandbox_is_checked_against_the_repository_before_anything_is_written() -> (
+    None
+):
+    """The same guard the audit applies to its review directory, applied earlier:
+    before the sandbox is created, not after it is populated."""
+    guard = RUNTIME_CODE.index("$resolvedSandbox.StartsWith($resolvedRepo")
+    first_write = RUNTIME_CODE.index("New-Item -ItemType Directory")
+
+    assert guard < first_write, "the sandbox is created before it is checked"
+
+
+def test_the_harness_writes_nothing_next_to_itself_or_in_the_repository() -> None:
+    """Every write target is built from $sandbox. A Join-Path against $PSScriptRoot
+    or $repoRoot would put fixtures or logs in the checkout."""
+    for line in RUNTIME_CODE.splitlines():
+        if "Write-TextFile" not in line and "New-Item" not in line:
+            continue
+        assert "$PSScriptRoot" not in line, f"writes next to the script: {line.strip()}"
+        assert "$repoRoot" not in line, f"writes into the repository: {line.strip()}"
+
+    # $repoRoot is read for two reasons only: the guard above, and the sweep that
+    # checks no generated review landed in the checkout.
+    uses = [line.strip() for line in RUNTIME_CODE.splitlines() if "$repoRoot" in line]
+    assert len(uses) == 3, f"unexpected uses of the repository root: {uses}"
+
+
+def test_the_harness_sweeps_the_repository_for_generated_reviews() -> None:
+    """Not a substitute for the guards above -- a check that they worked."""
+    assert "generated review(s) landed in the checkout" in RUNTIME_TEXT
+    assert "phase1g-execution-role-audit-*.md" in RUNTIME_CODE
+
+
+def test_the_sandbox_is_removed_in_a_finally_block() -> None:
+    """Whether the run passes, fails, or throws. A harness that only cleaned up on
+    success would litter the temp directory on exactly the runs someone re-runs."""
+    finally_block = RUNTIME_CODE[RUNTIME_CODE.index("finally {") :]
+
+    assert "Remove-Item -LiteralPath $sandbox -Recurse -Force" in finally_block
+
+
+def test_the_harness_has_no_cleanup_outside_the_finally_block() -> None:
+    """One removal, in the one place that always runs."""
+    removals = re.findall(r"Remove-Item[^\n]*\$sandbox", RUNTIME_CODE)
+
+    assert len(removals) == 1, f"expected one sandbox removal, found {removals}"
+
+
+# --- What the harness proves about the audit -------------------------------
+
+#: The six scenarios the task requires, keyed by the letter each is labelled with.
+REQUIRED_SCENARIOS = {
+    "A": "clean expected role",
+    "B": "zero attached managed policies",
+    "C": "multiple attached managed policies",
+    "D": "function configuration missing State",
+    "E": "function configuration with a null Role",
+    "F": "secret grant on every secret",
+}
+
+
+def harness_scenario_names() -> list[str]:
+    """Scenario labels only.
+
+    Anchored on an indented bare ``Name`` key, so ``$FixtureSecretName = '...'``
+    and its siblings at the top of the file are not mistaken for scenarios.
+    """
+    return re.findall(r"^\s+Name\s+=\s*'([^']+)'", RUNTIME_CODE, re.MULTILINE)
+
+
+def test_the_harness_declares_exactly_the_required_scenarios() -> None:
+    names = harness_scenario_names()
+
+    assert len(names) == len(REQUIRED_SCENARIOS), f"scenarios found: {names}"
+
+    for letter, description in REQUIRED_SCENARIOS.items():
+        expected = f"{letter}. {description}"
+        assert expected in names, f"missing scenario: {expected}"
+
+
+def test_the_clean_scenario_reaches_the_end_and_writes_a_review() -> None:
+    """Scenario A is the one that would have caught both administrator failures:
+    it runs every stage, with one attached policy and one inline policy, and
+    requires a review at the end."""
+    block = RUNTIME_CODE[RUNTIME_CODE.index("'A. clean expected role'") :]
+    block = block[: block.index("'B. zero attached")]
+
+    assert "ExpectedExit   = 0" in block
+    assert "ExpectReview   = $true" in block
+    assert "Audit complete. Nothing was changed." in block
+    assert "**Overall: PASS**" in block
+
+
+@pytest.mark.parametrize(
+    ("scenario", "following"),
+    [
+        ("'B. zero attached managed policies'", "'C. multiple attached"),
+        ("'C. multiple attached managed policies'", "'D. function configuration"),
+    ],
+)
+def test_the_collection_scenarios_complete(scenario: str, following: str) -> None:
+    """Zero and many, both expected to finish. The first administrator failure was
+    a one-item collection and the zero-item path was broken the same way, so a
+    harness that only covered "one" would not have caught it."""
+    block = RUNTIME_CODE[RUNTIME_CODE.index(scenario) :]
+    block = block[: block.index(following)]
+
+    assert "ExpectReview   = $true" in block
+    assert "ExpectedExit   = 0" in block
+
+
+@pytest.mark.parametrize(
+    ("scenario", "following", "field"),
+    [
+        (
+            "'D. function configuration missing State'",
+            "'E. function configuration",
+            "State",
+        ),
+        ("'E. function configuration with a null Role'", "'F. secret grant", "Role"),
+    ],
+)
+def test_the_incomplete_scenarios_fail_closed_and_write_no_review(
+    scenario: str, following: str, field: str
+) -> None:
+    """The second failure's territory. Each names its own missing field, each exits
+    1, and neither may write a review -- a review describing an audit that did not
+    finish reads as a completed one."""
+    block = RUNTIME_CODE[RUNTIME_CODE.index(scenario) :]
+    block = block[: block.index(following)]
+
+    assert "ExpectedExit   = 1" in block
+    assert "ExpectReview   = $false" in block
+    assert f"did not include the required field '{field}'" in block
+    assert "Audit did not complete. No review was written." in block
+
+
+def test_the_two_incomplete_scenarios_use_different_absent_shapes() -> None:
+    """One omits the key, the other sets it to null. A JMESPath query for a field
+    the response does not carry returns null rather than omitting it, so both
+    shapes occur in practice and both must fail."""
+    block = RUNTIME_CODE[
+        RUNTIME_CODE.index("'D. function configuration missing State'") :
+    ]
+    missing_key = block[: block.index("'E. function configuration")]
+    nulled = block[block.index("'E. function configuration") :]
+    nulled = nulled[: nulled.index("'F. secret grant")]
+
+    assert '"State"' not in missing_key, "scenario D still supplies State"
+    assert '"Role":null' in nulled, "scenario E does not null the Role"
+
+
+def test_the_incomplete_scenarios_reject_the_old_failure_message() -> None:
+    """A rerun against the old script would abort with the field-count message.
+    Asserting its absence is how the harness proves which script it ran."""
+    block = RUNTIME_CODE[
+        RUNTIME_CODE.index("'D. function configuration missing State'") :
+    ]
+    block = block[: block.index("'E. function configuration")]
+
+    assert "returned fewer fields than expected" in block
+
+
+def test_the_failing_scenario_completes_and_still_writes_a_review() -> None:
+    """The distinction the review gate turns on: a *finding* is a completed audit
+    and gets a review with exit 2. An *incomplete* audit gets neither."""
+    block = RUNTIME_CODE[RUNTIME_CODE.index("'F. secret grant on every secret'") :]
+
+    assert "ExpectedExit   = 2" in block
+    assert "ExpectReview   = $true" in block
+    assert "**Overall: FAIL**" in block
+
+
+def test_the_harness_checks_the_written_review_for_leaks() -> None:
+    """The audit scans the review before writing it. The harness checks the file
+    that actually landed, which is a different statement and a stronger one."""
+    assert "the written review leaked" in RUNTIME_TEXT
+    assert "$PlaceholderAccountId, $FixtureSecretName" in RUNTIME_CODE
+
+
+def test_the_harness_checks_the_terminal_output_for_the_account_id() -> None:
+    assert "the account ID reached the terminal" in RUNTIME_TEXT
+
+
+def test_the_harness_runs_the_audit_as_a_child_process() -> None:
+    """The audit ends in `exit`, which would terminate the harness on the first
+    scenario if it were dot-sourced -- and the exit code is what every scenario
+    asserts."""
+    assert "-File', $ScriptPath" in RUNTIME_CODE
+    assert "$LASTEXITCODE" in RUNTIME_CODE
+    assert "Get-Process -Id $PID" in RUNTIME_CODE
+    assert "'-NoOpen'" in RUNTIME_CODE, "the audit would open an editor per scenario"
+
+
+def test_the_harness_runs_the_same_powershell_host_it_was_started_with() -> None:
+    """Testing the audit under PowerShell 7 while the administrator runs Windows
+    PowerShell 5.1 would have passed both failures."""
+    helper = RUNTIME_CODE[RUNTIME_CODE.index("function Get-PowerShellHostPath") :]
+    helper = helper[: helper.index("function Invoke-ChildAudit")]
+
+    assert "(Get-Process -Id $PID).Path" in helper
+    assert "$PSHOME" in helper, "there is no fallback if the process path is empty"
+
+
+def test_the_harness_exits_nonzero_when_any_scenario_fails() -> None:
+    assert "$exitCode = 1" in RUNTIME_CODE
+    assert "exit $exitCode" in RUNTIME_CODE
+
+    tail = RUNTIME_CODE[RUNTIME_CODE.rindex("if ($script:Failures.Count -eq 0)") :]
+    assert "$exitCode = 1" in tail, "a failure does not change the exit code"
+
+
+def test_the_harness_makes_no_mutating_aws_call_of_any_kind() -> None:
+    """The audit's allow-list gate applies to the audit. This checks the harness
+    itself never names a mutating operation, in a fixture or anywhere else."""
+    for prefix in MUTATION_PREFIXES:
+        for match in re.findall(rf"\b{re.escape(prefix)}[a-z-]*\b", RUNTIME_CODE):
+            # 'set-' appears as Set-Item-style cmdlet names and 'remove-' as
+            # Remove-Item; neither is an AWS operation. AWS operations only ever
+            # appear in this harness as a fixture filename, and those are reads.
+            assert not match.startswith(("create-secret", "put-", "attach-")), (
+                f"the harness names a mutating AWS operation: {match}"
+            )
+
+    for operation in ("put-role-policy", "attach-role-policy", "update-function"):
+        assert operation not in RUNTIME_CODE, f"the harness names {operation}"
+
+
+def test_the_harness_fixtures_only_use_the_placeholder_account_id() -> None:
+    """The harness is in PHASE1G_FILES, so the repository-wide scans already reject
+    a real identifier. This states the positive form: the fixtures use the
+    documented placeholder and nothing else."""
+    for match in re.findall(r"\b\d{12}\b", RUNTIME_TEXT):
+        assert match in PLACEHOLDER_ACCOUNT_IDS, f"non-placeholder account ID: {match}"
+
+    assert "$PlaceholderAccountId = '123456789012'" in RUNTIME_CODE
+    assert "$FixtureSecretName = 'fixture-secret'" in RUNTIME_CODE
+
+
+def test_the_harness_secret_name_is_obviously_not_a_live_identifier() -> None:
+    """The audit takes the secret identifier as a mandatory parameter so it is
+    never committed. A harness that hardcoded the real one would undo that."""
+    assert "fixture-secret" in RUNTIME_CODE
+    assert not re.search(r"graceful-gut-ai/[a-z0-9/_-]+", RUNTIME_TEXT)
+
+
+def test_the_harness_fixtures_cover_every_allow_listed_read() -> None:
+    """A fixture missing for an allow-listed read means the fake CLI returns 253
+    and the scenario fails for the wrong reason."""
+    fixtures = set(re.findall(r"\$fixtures\['([a-z-]+_[a-z-]+)'\]", RUNTIME_CODE))
+    expected = {pair.replace(":", "_") for pair in READ_ONLY_OPERATIONS}
+
+    assert fixtures == expected, (
+        f"fixture set does not match the allow-list: "
+        f"missing {sorted(expected - fixtures)}, extra {sorted(fixtures - expected)}"
+    )
+
+
+def test_the_fixtures_keep_records_and_collections_distinct() -> None:
+    """The fixtures have to reproduce the shape the CLI returns, or the harness
+    would prove nothing about the failure it exists to catch: a fixed record is a
+    JSON object and the two collections are JSON arrays."""
+    defined = set(re.findall(r"\$fixtures\['([a-z-]+_[a-z-]+)'\]", RUNTIME_CODE))
+
+    for pair in COLLECTION_QUERIES:
+        key = pair.replace(":", "_")
+        assert key in defined, f"no fixture for the collection read {pair}"
+
+    # The attached-policy fixture is an array of named rows -- both sides of the
+    # split in one payload.
+    assert '[{"PolicyName":"AWSLambdaBasicExecutionRole"' in RUNTIME_TEXT
+    assert '["GracefulGutAI-ReadApiKeySecret"]' in RUNTIME_TEXT
+
+    # And the function configuration fixture is an object with named fields.
+    assert '{`"State`":`"Active`",`"LastUpdateStatus`":' in RUNTIME_TEXT
+
+
+def test_the_harness_does_not_shadow_the_audit_as_the_thing_being_tested() -> None:
+    """It runs the tracked script from its own directory. A harness carrying its
+    own copy of the audit would pass while the real one stayed broken."""
+    assert "Join-Path $PSScriptRoot 'audit-lambda-execution-role.ps1'" in RUNTIME_CODE
+    assert "Audit script not found next to this harness" in RUNTIME_TEXT

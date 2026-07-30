@@ -23,6 +23,18 @@
         the failure is specific rather than generic. This audit inspects who may
         read the secret; it never reads it.
 
+      * A third gate covers what a call may ask *for*, not only which call it is.
+        Two operations may not be invoked without a --query narrowing the
+        response, and no query may name Environment, SecretString, or
+        SecretBinary. That keeps the function's environment variables -- which
+        carry GG_API_SECRET_ID -- out of this process rather than fetching them
+        and relying on masking afterwards.
+
+    Every fixed-shape response is requested as a JMESPath multiselect hash and
+    read by field name; only genuine collections are normalised by length. That
+    separation is load-bearing rather than stylistic, and the reasoning is on
+    ConvertFrom-AwsJsonList.
+
       * Nothing is corrected. Where the role is wrong, the script prints the
         least-privilege correction an administrator would apply and stops. An
         audit tool that repairs what it audits destroys the evidence and removes
@@ -151,6 +163,28 @@ $ReadOnlyOperations = @(
 $ForbiddenOperations = @(
     'secretsmanager:get-secret-value',
     'secretsmanager:batch-get-secret-value'
+)
+
+#: Response fields this script must never ask AWS for, enforced against the
+#: --query of every call. Environment is the one that matters most:
+#: get-function-configuration returns Environment.Variables, which carries
+#: GG_API_SECRET_ID, so a query that omits the field keeps the value out of this
+#: process entirely rather than fetching it and relying on masking. SecretString
+#: and SecretBinary are named for the same reason get-secret-value is on the
+#: forbidden list -- the refusal should be specific, not incidental.
+$ForbiddenQueryFields = @(
+    'Environment',
+    'SecretString',
+    'SecretBinary'
+)
+
+#: Operations whose full response carries something this script must not hold, and
+#: which therefore may not be called without a --query narrowing it. Listing the
+#: operation rather than trusting each call site means a new call that forgets the
+#: --query fails on the first run instead of quietly pulling the whole record.
+$QueryRequiredOperations = @(
+    'lambda:get-function-configuration',
+    'secretsmanager:describe-secret'
 )
 
 # ---------------------------------------------------------------------------
@@ -508,6 +542,44 @@ must be a read, and it must be added to `$ReadOnlyOperations deliberately.
 "@
     }
 
+    # Third gate: what the call is allowed to ask *for*. Walked rather than
+    # indexed, so there is no length assumption about $Arguments and no index to
+    # guard -- the same discipline the fixed-record reads now follow.
+    $queryText = $null
+    $expectQuery = $false
+    foreach ($argument in $Arguments) {
+        $token = [string]$argument
+        if ($expectQuery) {
+            $queryText = $token
+            $expectQuery = $false
+            continue
+        }
+        if ($token -eq '--query') { $expectQuery = $true }
+    }
+
+    if ($QueryRequiredOperations -contains $pair -and $null -eq $queryText) {
+        Stop-Run -Message @"
+Refused: $pair was called without a --query.
+
+The full response for this operation carries values this audit must not hold.
+Narrowing it server-side is what keeps them out of this process; masking a value
+already in memory is a weaker control and this script does not rely on one.
+"@
+    }
+
+    if ($null -ne $queryText) {
+        foreach ($field in $ForbiddenQueryFields) {
+            if ($queryText -like "*$field*") {
+                Stop-Run -Message @"
+Refused: the query for $pair asks for '$field'.
+
+This audit inspects which principals may read a value. It never requests the
+value, and it never requests the function's environment variables.
+"@
+            }
+        }
+    }
+
     $full = @('--profile', $Profile, '--region', $Region, $Service, $Operation) + $Arguments
     $result = Invoke-Native -Command 'aws' -Arguments $full
 
@@ -527,10 +599,38 @@ $($result.Output)
     return $result
 }
 
-function ConvertFrom-AwsJson {
+function ConvertFrom-AwsJsonList {
     <#
     .SYNOPSIS
-        Parse AWS CLI JSON output, failing closed on anything unparseable.
+        Parse AWS CLI JSON output that is a *collection*, failing closed on
+        anything unparseable.
+
+    .DESCRIPTION
+        This function is one half of a deliberate split, and the split is the fix
+        for the second administrator failure. Every AWS response this script reads
+        is one of two kinds, and the two need opposite handling:
+
+          * A **collection** -- the attached-policy list, the inline-policy name
+            list, a Statement array, an Action or Resource value. Its length is
+            data: zero, one, and many are all legitimate answers, and the hazard is
+            PowerShell unwrapping a one-item list into a scalar. Those responses
+            come through here and then through Get-AsArray.
+
+          * A **fixed record** -- get-caller-identity, get-function-configuration,
+            describe-secret, get-role, get-policy, get-policy-version. Its shape is
+            known before the call is made and its length is not data at all. Those
+            responses come through ConvertFrom-AwsJsonRecord and are read by field
+            name.
+
+        Mixing the two is what stopped the second administrator run. The function
+        configuration was requested as the positional list [State,LastUpdateStatus,
+        Role] and then length-checked, so a fixed record was being handled by the
+        collection machinery. That request was type-unsafe before any parsing
+        happened: whether three positional fields arrive as three items or as one
+        nested item depends on the PowerShell version and the CLI version, and a
+        script that depends on which is a script that works on one host and fails
+        on the next. Asking for named fields removes the question rather than
+        answering it.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Text,
@@ -547,6 +647,145 @@ function ConvertFrom-AwsJson {
     catch {
         Stop-Run -Message "Could not parse $What as JSON."
     }
+}
+
+function ConvertFrom-AwsJsonRecord {
+    <#
+    .SYNOPSIS
+        Parse a fixed-shape AWS response into one object with named properties.
+
+    .DESCRIPTION
+        Every call site that uses this asks the CLI for a JMESPath multiselect
+        *hash* -- '{State:State}' rather than '[State]' -- so the reply is a JSON
+        object. A JSON object crosses ConvertFrom-Json as a single object on
+        Windows PowerShell 5.1 and on PowerShell 7 alike: it has no elements, so
+        there is nothing for the pipeline to enumerate, nothing for a caller to
+        re-wrap, and no position for a field to move to.
+
+        The guards below are what make that a property of the script rather than a
+        hope about the CLI. A list arriving here means some call site went back to
+        a positional query, and it stops the run instead of being indexed.
+
+        -InputObject rather than the pipeline is deliberate for the same reason:
+        the pipeline is the mechanism that unwraps collections, and a record
+        parser should not depend on its behaviour at all.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Text,
+        [Parameter(Mandatory = $true)][string]$What
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        Stop-Run -Message "Empty response where $What was expected."
+    }
+
+    $parsed = $null
+    try {
+        $parsed = ConvertFrom-Json -InputObject $Text
+    }
+    catch {
+        Stop-Run -Message "Could not parse $What as JSON."
+    }
+
+    if ($null -eq $parsed) {
+        Stop-Run -Message "No $What was returned."
+    }
+
+    # Order matters: a string is an IEnumerable in .NET, so it has to be rejected
+    # as a scalar before the collection test would misreport it as a list.
+    if ($parsed -is [string] -or $parsed -is [System.ValueType]) {
+        Stop-Run -Message "$What arrived as a single value where a named record was expected."
+    }
+
+    if ($parsed -is [System.Collections.IEnumerable]) {
+        Stop-Run -Message @"
+$What arrived as a list where a single named record was expected.
+
+A fixed-shape response must be requested as a JMESPath multiselect hash --
+'{Field:Field}' -- and read by field name. A positional '[Field,Field]' query
+returns a list whose meaning depends on position, and that is what broke this
+audit once already.
+"@
+    }
+
+    return $parsed
+}
+
+function Get-RequiredField {
+    <#
+    .SYNOPSIS
+        Read one named, non-empty string field from a fixed record, or stop.
+
+    .DESCRIPTION
+        Each field is validated on its own and named in its own failure message.
+        That is the whole difference between this and the length check it replaces.
+        "The function configuration query returned fewer fields than expected"
+        told an administrator that something was missing but not what: it said the
+        same thing whether State, LastUpdateStatus, or Role was absent, and it also
+        said it when all three were present and merely arrived nested one level
+        deeper than the indexing assumed. A message that cannot distinguish a
+        missing field from a misread response is not a diagnostic.
+
+        A field the CLI could not resolve comes back as JSON null, so
+        present-but-null is treated exactly as absent. Both mean "the audit does
+        not know this value", and an audit that continues without knowing is the
+        failure this script exists to prevent.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Record,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$What,
+        [Parameter(Mandatory = $false)][string]$Message = ''
+    )
+
+    $failure = $Message
+    if ([string]::IsNullOrWhiteSpace($failure)) {
+        $failure = "$What did not include the required field '$Name'."
+    }
+
+    if (-not (Test-HasProperty -Object $Record -Name $Name)) {
+        Stop-Run -Message $failure
+    }
+
+    $value = $Record.$Name
+    if ($null -eq $value) {
+        Stop-Run -Message $failure
+    }
+
+    if ($value -isnot [string]) {
+        Stop-Run -Message "$What returned '$Name' as something other than a string."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        Stop-Run -Message $failure
+    }
+
+    return $value
+}
+
+function Get-OptionalField {
+    <#
+    .SYNOPSIS
+        Read a named field that is legitimately allowed to be absent or null.
+
+    .DESCRIPTION
+        Exactly one field qualifies: describe-secret's KmsKeyId, which is null
+        whenever the secret uses the AWS-managed key. That is a normal answer
+        rather than a missing one, and requiring it would fail the audit on the
+        configuration the deployment actually has. Every other field is read with
+        Get-RequiredField, so "optional" is a decision recorded at one call site
+        rather than a default.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Record,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if (-not (Test-HasProperty -Object $Record -Name $Name)) { return '' }
+
+    $value = $Record.$Name
+    if ($null -eq $value) { return '' }
+    return [string]$value
 }
 
 function ConvertFrom-PolicyDocument {
@@ -572,7 +811,9 @@ function ConvertFrom-PolicyDocument {
         if ($text -match '%7[bB]' -or $text -match '%22') {
             $text = [System.Uri]::UnescapeDataString($text)
         }
-        return ConvertFrom-AwsJson -Text $text -What $What
+        # A policy document is a fixed record -- Version and Statement -- so it is
+        # parsed as one, not as a collection.
+        return ConvertFrom-AwsJsonRecord -Text $text -What $What
     }
 
     if ($null -eq $Document) {
@@ -592,12 +833,54 @@ function Test-HasProperty {
     return [bool]($Object.PSObject.Properties.Name -contains $Name)
 }
 
+function Get-RoleNameFromArn {
+    <#
+    .SYNOPSIS
+        Extract a role name from a role ARN without ever emitting the ARN.
+
+    .DESCRIPTION
+        The ARN carries the account ID, so it must not reach a terminal, a review
+        file, or an error message. The name is what the audit actually needs: the
+        question being asked is whether the function is configured with the role
+        being audited, and that is a comparison between two names.
+
+        A regex with a named capture rather than a split on '/': a pathed role ARN
+        is 'role/path/to/Name', so the name is the last segment and taking it by
+        position is correct only by accident. The failure message names the field
+        that was wrong and nothing else -- in particular, not the value.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Arn,
+        [Parameter(Mandatory = $true)][string]$What
+    )
+
+    $match = [regex]::Match(
+        $Arn, '^arn:aws[a-z0-9-]*:iam::\d{12}:role/(?:.+/)?(?<name>[^/]+)$')
+
+    if (-not $match.Success) {
+        Stop-Run -Message "The $What is not a recognisable IAM role ARN."
+    }
+
+    $name = [string]$match.Groups['name'].Value
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        Stop-Run -Message "The $What carried no role name."
+    }
+
+    return $name
+}
+
 function Get-AsArray {
     <#
     .SYNOPSIS
-        Normalise a value into a real array, and return it as one.
+        Normalise a *collection* into a real array, and return it as one.
 
     .DESCRIPTION
+        This is the collection half of the split described on
+        ConvertFrom-AwsJsonList. It is for values whose length is data. It is not
+        for fixed records: a record read through here would be turned into a
+        one-element array and then indexed by position, which is exactly the
+        category error that stopped the second administrator run.
+
         Two separate PowerShell behaviours have to be defeated here. The first
         version of this function handled one of them and was broken by the other.
 
@@ -631,6 +914,21 @@ function Get-AsArray {
         instead of by another failed administrator run. The $null case is handled
         here and only here, because `@($null)` is a one-element array containing
         $null -- so wrapping at the call site cannot fix it.
+
+        3. **-NoEnumerate's own output is not the same object on both hosts.**
+           Windows PowerShell 5.1 hands the collection over inside a [psobject]
+           wrapper; PowerShell 7 does not. `@(...)` at a call site cannot see
+           through that wrapper, so on 5.1 it collects the wrapper as a single
+           item and produces a one-element array whose element is the real array
+           -- a nested collection where a flat one was expected.
+
+           That is the shape the second administrator failure reported, and it is
+           why every call site casts to [object[]] before the `@(...)`. The cast
+           unwraps a [psobject] and leaves a plain array untouched, so the call
+           site is correct under both behaviours and does not depend on which host
+           it is running on. This host has no PowerShell interpreter and cannot
+           settle that question by experiment, which is precisely the reason not to
+           depend on the answer.
     #>
     param([Parameter(Mandatory = $false)]$Value)
 
@@ -651,7 +949,7 @@ function Get-CallerAccountId {
     Write-Section 'Caller'
 
     $result = Invoke-AwsRead -Service 'sts' -Operation 'get-caller-identity' `
-        -Arguments @('--query', 'Account', '--output', 'text') `
+        -Arguments @('--query', '{Account:Account}', '--output', 'json') `
         -FailureMessage @"
 Could not resolve the AWS caller identity.
 
@@ -660,7 +958,14 @@ needs administrator credentials: the Claude dev role cannot read this role's
 policies and cannot run this audit.
 "@
 
-    $accountId = $result.Output.Trim()
+    # A named field rather than '--output text'. Text output is a bare value whose
+    # meaning depends on nothing being added to the query later, and it gives the
+    # parser no way to tell an empty answer from a missing one.
+    $identity = ConvertFrom-AwsJsonRecord -Text $result.Output -What 'the caller identity'
+    $accountId = Get-RequiredField -Record $identity -Name 'Account' `
+        -What 'the caller identity' `
+        -Message 'The caller identity did not resolve to an account ID.'
+
     if ($accountId -notmatch '^\d{12}$') {
         Stop-Run -Message 'The caller identity did not resolve to an account ID.'
     }
@@ -683,7 +988,20 @@ function Get-FunctionRoleName {
         performance one: the full configuration includes Environment.Variables,
         which carries GG_API_SECRET_ID. Querying server-side means the value
         never enters this process, which is stronger than fetching it and
-        remembering to mask it.
+        remembering to mask it. Invoke-AwsRead now enforces both halves of that --
+        the --query is mandatory for this operation, and a query naming
+        Environment is refused.
+
+        The three fields are requested as a JMESPath multiselect *hash*, so they
+        arrive as named properties on one object. This is the second
+        administrator failure and its fix. The previous version asked for the
+        positional list [State,LastUpdateStatus,Role] and then checked that three
+        items had arrived; the run stopped with "The function configuration query
+        returned fewer fields than expected", because a fixed record was being
+        handled as a variable-length collection and the three fields arrived in a
+        shape the length check did not recognise. Position was never the right
+        thing to depend on: a name cannot shift, cannot nest, and cannot be
+        miscounted, so each field is now validated on its own and read by name.
 
         The role ARN is never printed. The role NAME is compared, because that is
         what the audit needs to establish, and the ARN would carry the account ID.
@@ -693,20 +1011,22 @@ function Get-FunctionRoleName {
     $result = Invoke-AwsRead -Service 'lambda' -Operation 'get-function-configuration' `
         -Arguments @(
             '--function-name', $FunctionName,
-            '--query', '[State,LastUpdateStatus,Role]',
+            '--query', '{State:State,LastUpdateStatus:LastUpdateStatus,Role:Role}',
             '--output', 'json'
         ) `
         -FailureMessage "Could not read the configuration of function '$FunctionName'."
 
-    $fields = ConvertFrom-AwsJson -Text $result.Output -What 'the function configuration'
-    $values = @(Get-AsArray -Value $fields)
-    if ($values.Count -lt 3) {
-        Stop-Run -Message 'The function configuration query returned fewer fields than expected.'
-    }
+    $configuration = ConvertFrom-AwsJsonRecord -Text $result.Output `
+        -What 'the function configuration'
 
-    $state = [string]$values[0]
-    $lastUpdate = [string]$values[1]
-    $roleArn = [string]$values[2]
+    # Three independent validations, each naming its own field. No length check and
+    # no positional index: the shape of this response is not data.
+    $state = Get-RequiredField -Record $configuration -Name 'State' `
+        -What 'the function configuration'
+    $lastUpdate = Get-RequiredField -Record $configuration -Name 'LastUpdateStatus' `
+        -What 'the function configuration'
+    $roleArn = Get-RequiredField -Record $configuration -Name 'Role' `
+        -What 'the function configuration'
 
     $isActive = ($state -eq 'Active')
     $stateSeverity = 'Fail'
@@ -726,12 +1046,8 @@ function Get-FunctionRoleName {
         Stop-Run -Message "Function '$FunctionName' last update was not Successful (status: $lastUpdate)."
     }
 
-    if ($roleArn -notmatch '^arn:aws[a-z0-9-]*:iam::\d{12}:role/') {
-        Stop-Run -Message 'The function''s configured role is not a recognisable IAM role ARN.'
-    }
-
-    # Take the last path segment: service-linked and pathed roles carry slashes.
-    $configuredRoleName = ($roleArn -split '/')[-1]
+    $configuredRoleName = Get-RoleNameFromArn -Arn $roleArn `
+        -What "function's configured role"
 
     $matchesExpected = ($configuredRoleName -eq $RoleName)
     $roleSeverity = 'Fail'
@@ -781,7 +1097,7 @@ function Get-ExpectedSecret {
     $result = Invoke-AwsRead -Service 'secretsmanager' -Operation 'describe-secret' `
         -Arguments @(
             '--secret-id', $ExpectedSecretName,
-            '--query', '[ARN,KmsKeyId]',
+            '--query', '{Arn:ARN,KmsKeyId:KmsKeyId}',
             '--output', 'json'
         ) `
         -AllowFailure
@@ -800,18 +1116,17 @@ $($result.Output)
 "@
     }
 
-    $fields = @(Get-AsArray -Value (ConvertFrom-AwsJson -Text $result.Output -What 'the secret metadata'))
+    $metadata = ConvertFrom-AwsJsonRecord -Text $result.Output -What 'the secret metadata'
 
-    # Guarded before indexing, like every other index in this script. The query
-    # asks for two fields so two should arrive, but "should" is what the first
-    # run's Count failure was built on.
-    if ($fields.Count -lt 1) {
-        Stop-Run -Message 'The secret metadata query returned no fields.'
-    }
+    # Named fields, so the two are told apart by name rather than by position and
+    # the optional one is optional on purpose. The previous version indexed [0] and
+    # [1] behind a length check -- the same category error as the function
+    # configuration, and it would have failed the same way for the same reason.
+    $arn = Get-RequiredField -Record $metadata -Name 'Arn' -What 'the secret metadata'
 
-    $arn = [string]$fields[0]
-    $kmsKeyId = ''
-    if ($fields.Count -gt 1 -and $null -ne $fields[1]) { $kmsKeyId = [string]$fields[1] }
+    # KmsKeyId is null whenever the secret uses the AWS-managed key, which is a
+    # real answer and not a missing field.
+    $kmsKeyId = Get-OptionalField -Record $metadata -Name 'KmsKeyId'
 
     $script:ExpectedSecretArn = $arn
 
@@ -856,7 +1171,7 @@ function Test-TrustPolicy {
     $result = Invoke-AwsRead -Service 'iam' -Operation 'get-role' `
         -Arguments @(
             '--role-name', $RoleName,
-            '--query', 'Role.AssumeRolePolicyDocument',
+            '--query', '{AssumeRolePolicyDocument:Role.AssumeRolePolicyDocument}',
             '--output', 'json'
         ) `
         -FailureMessage @"
@@ -866,8 +1181,13 @@ Administrator credentials are required. The Claude dev role holds iam:GetRole on
 this role but none of the policy-listing actions this audit needs.
 "@
 
+    $roleRecord = ConvertFrom-AwsJsonRecord -Text $result.Output -What 'the role metadata'
+    if (-not (Test-HasProperty -Object $roleRecord -Name 'AssumeRolePolicyDocument')) {
+        Stop-Run -Message 'The role metadata did not include a trust policy document.'
+    }
+
     $document = ConvertFrom-PolicyDocument `
-        -Document (ConvertFrom-AwsJson -Text $result.Output -What 'the trust policy') `
+        -Document $roleRecord.AssumeRolePolicyDocument `
         -What 'the trust policy'
 
     $findings = New-Object System.Collections.Generic.List[object]
@@ -877,7 +1197,7 @@ this role but none of the policy-listing actions this audit needs.
         Stop-Run -Message 'The trust policy has no Statement array.'
     }
 
-    $statements = @(Get-AsArray -Value $document.Statement)
+    $statements = @([object[]](Get-AsArray -Value $document.Statement))
     $sawAccountPrincipal = $false
     $sawFederatedPrincipal = $false
     $sawWildcardPrincipal = $false
@@ -891,8 +1211,8 @@ this role but none of the policy-listing actions this audit needs.
             if ([string]$statement.Effect -eq 'Deny') { $sawDeny = $true }
         }
 
-        foreach ($action in @(Get-AsArray -Value $(
-                    if (Test-HasProperty -Object $statement -Name 'Action') { $statement.Action } else { $null }))) {
+        foreach ($action in @([object[]](Get-AsArray -Value $(
+                    if (Test-HasProperty -Object $statement -Name 'Action') { $statement.Action } else { $null })))) {
             if ([string]$action -notmatch '^sts:AssumeRole$') { $sawNonAssumeAction = $true }
         }
 
@@ -913,7 +1233,7 @@ this role but none of the policy-listing actions this audit needs.
 
         foreach ($property in $principal.PSObject.Properties) {
             $key = $property.Name
-            $values = @(Get-AsArray -Value $property.Value)
+            $values = @([object[]](Get-AsArray -Value $property.Value))
 
             switch ($key) {
                 'Service' {
@@ -1008,12 +1328,19 @@ function Get-AttachedPolicyDocuments {
     $result = Invoke-AwsRead -Service 'iam' -Operation 'list-attached-role-policies' `
         -Arguments @(
             '--role-name', $RoleName,
-            '--query', 'AttachedPolicies[].[PolicyName,PolicyArn]',
+            '--query', 'AttachedPolicies[].{PolicyName:PolicyName,PolicyArn:PolicyArn}',
             '--output', 'json'
         ) `
         -FailureMessage "Could not list attached policies for role '$RoleName'."
 
-    $rows = @(Get-AsArray -Value (ConvertFrom-AwsJson -Text $result.Output -What 'the attached policy list'))
+    # Both halves of the split, in one call. The *list* is a collection -- zero,
+    # one, and many attached policies are all legitimate, so it goes through
+    # Get-AsArray. Each *row* is a fixed record, so it is requested as a
+    # multiselect hash and read by field name. The previous version asked for
+    # positional rows and skipped any row that did not arrive with two items,
+    # which is worse than failing: a malformed row meant a policy silently absent
+    # from the audit.
+    $rows = @([object[]](Get-AsArray -Value (ConvertFrom-AwsJsonList -Text $result.Output -What 'the attached policy list')))
     $policies = New-Object System.Collections.Generic.List[object]
 
     if ($rows.Count -eq 0) {
@@ -1022,11 +1349,10 @@ function Get-AttachedPolicyDocuments {
     }
 
     foreach ($row in $rows) {
-        $pair = @(Get-AsArray -Value $row)
-        if ($pair.Count -lt 2) { continue }
-
-        $policyName = [string]$pair[0]
-        $policyArn = [string]$pair[1]
+        $policyName = Get-RequiredField -Record $row -Name 'PolicyName' `
+            -What 'an attached policy entry'
+        $policyArn = Get-RequiredField -Record $row -Name 'PolicyArn' `
+            -What "attached policy '$policyName'"
 
         # AWS-managed policies carry ':aws:' in place of an account ID.
         $isAwsManaged = ($policyArn -match '^arn:aws[a-z0-9-]*:iam::aws:policy/')
@@ -1034,27 +1360,34 @@ function Get-AttachedPolicyDocuments {
         $versionResult = Invoke-AwsRead -Service 'iam' -Operation 'get-policy' `
             -Arguments @(
                 '--policy-arn', $policyArn,
-                '--query', 'Policy.DefaultVersionId',
-                '--output', 'text'
+                '--query', '{DefaultVersionId:Policy.DefaultVersionId}',
+                '--output', 'json'
             ) `
             -FailureMessage "Could not read managed policy '$policyName'."
 
-        $versionId = $versionResult.Output.Trim()
-        if ([string]::IsNullOrWhiteSpace($versionId)) {
-            Stop-Run -Message "Managed policy '$policyName' returned no default version ID."
-        }
+        $versionRecord = ConvertFrom-AwsJsonRecord -Text $versionResult.Output `
+            -What "managed policy '$policyName'"
+        $versionId = Get-RequiredField -Record $versionRecord -Name 'DefaultVersionId' `
+            -What "managed policy '$policyName'" `
+            -Message "Managed policy '$policyName' returned no default version ID."
 
         $documentResult = Invoke-AwsRead -Service 'iam' -Operation 'get-policy-version' `
             -Arguments @(
                 '--policy-arn', $policyArn,
                 '--version-id', $versionId,
-                '--query', 'PolicyVersion.Document',
+                '--query', '{Document:PolicyVersion.Document}',
                 '--output', 'json'
             ) `
             -FailureMessage "Could not read version $versionId of policy '$policyName'."
 
+        $documentRecord = ConvertFrom-AwsJsonRecord -Text $documentResult.Output `
+            -What "policy '$policyName'"
+        if (-not (Test-HasProperty -Object $documentRecord -Name 'Document')) {
+            Stop-Run -Message "Managed policy '$policyName' returned no document."
+        }
+
         $document = ConvertFrom-PolicyDocument `
-            -Document (ConvertFrom-AwsJson -Text $documentResult.Output -What "policy '$policyName'") `
+            -Document $documentRecord.Document `
             -What "policy '$policyName'"
 
         $kind = 'customer-managed'
@@ -1096,7 +1429,9 @@ function Get-InlinePolicyDocuments {
         ) `
         -FailureMessage "Could not list inline policies for role '$RoleName'."
 
-    $names = @(Get-AsArray -Value (ConvertFrom-AwsJson -Text $result.Output -What 'the inline policy list'))
+    # PolicyNames is a genuine collection of scalars, so it stays on the
+    # collection side of the split: normalised, never counted for correctness.
+    $names = @([object[]](Get-AsArray -Value (ConvertFrom-AwsJsonList -Text $result.Output -What 'the inline policy list')))
     $policies = New-Object System.Collections.Generic.List[object]
 
     if ($names.Count -eq 0) {
@@ -1106,18 +1441,27 @@ function Get-InlinePolicyDocuments {
 
     foreach ($name in $names) {
         $policyName = [string]$name
+        if ([string]::IsNullOrWhiteSpace($policyName)) {
+            Stop-Run -Message 'The inline policy list contained an entry with no name.'
+        }
 
         $documentResult = Invoke-AwsRead -Service 'iam' -Operation 'get-role-policy' `
             -Arguments @(
                 '--role-name', $RoleName,
                 '--policy-name', $policyName,
-                '--query', 'PolicyDocument',
+                '--query', '{PolicyDocument:PolicyDocument}',
                 '--output', 'json'
             ) `
             -FailureMessage "Could not read inline policy '$policyName'."
 
+        $documentRecord = ConvertFrom-AwsJsonRecord -Text $documentResult.Output `
+            -What "inline policy '$policyName'"
+        if (-not (Test-HasProperty -Object $documentRecord -Name 'PolicyDocument')) {
+            Stop-Run -Message "Inline policy '$policyName' returned no document."
+        }
+
         $document = ConvertFrom-PolicyDocument `
-            -Document (ConvertFrom-AwsJson -Text $documentResult.Output -What "inline policy '$policyName'") `
+            -Document $documentRecord.PolicyDocument `
             -What "inline policy '$policyName'"
 
         $expected = ($policyName -eq $ExpectedInlinePolicyName)
@@ -1201,7 +1545,7 @@ function Get-ResourceScope {
     #>
     param([Parameter(Mandatory = $false)]$Resource)
 
-    $values = @(Get-AsArray -Value $Resource)
+    $values = @([object[]](Get-AsArray -Value $Resource))
     if ($values.Count -eq 0) { return 'unspecified' }
 
     $anyWildcard = $false
@@ -1258,7 +1602,7 @@ function Test-PolicyStatements {
             continue
         }
 
-        foreach ($statement in @(Get-AsArray -Value $document.Statement)) {
+        foreach ($statement in @([object[]](Get-AsArray -Value $document.Statement))) {
             $statementCount++
 
             $effect = 'Allow'
@@ -1298,8 +1642,8 @@ function Test-PolicyStatements {
             $scope = Get-ResourceScope -Resource $(
                 if (Test-HasProperty -Object $statement -Name 'Resource') { $statement.Resource } else { $null })
 
-            $actions = @(Get-AsArray -Value $(
-                if (Test-HasProperty -Object $statement -Name 'Action') { $statement.Action } else { $null }))
+            $actions = @([object[]](Get-AsArray -Value $(
+                if (Test-HasProperty -Object $statement -Name 'Action') { $statement.Action } else { $null })))
 
             if ($actions.Count -eq 0) {
                 Add-Finding -Severity 'Review' -Title 'Allow statement grants no action' -Where $label
