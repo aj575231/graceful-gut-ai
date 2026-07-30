@@ -455,6 +455,20 @@ function Get-Scenarios {
         })
 
     # --- B: zero attached policies -----------------------------------------
+    # A role with no managed policy writes no logs, so the audit records a REVIEW
+    # and the run's verdict is REVIEW. Exit stays 0 -- a REVIEW is a request for
+    # an administrator's judgement, not a failed run.
+    #
+    # This scenario asserted `**Overall: PASS**` until 2026-07-30, and that
+    # expectation was correct for the script it was written against: the
+    # zero-policy branch *printed* a REVIEW and recorded nothing, so the review
+    # file it produced genuinely did say PASS. B was pinning the terminal/review
+    # disagreement in place rather than catching it, and it was the one scenario
+    # whose fixture made that disagreement visible without an unrecognised policy
+    # name being involved.
+    #
+    # It now asserts the finding in both artefacts, which is the rule every other
+    # completed scenario follows.
     $scenarios.Add(@{
             Name           = 'B. zero attached managed policies'
             Fixtures       = New-FixtureSet -Override @{
@@ -465,10 +479,20 @@ function Get-Scenarios {
             ExpectedCalls  = 7
             MustContain    = @(
                 'No managed policy is attached',
+                'Execution role audit: REVIEW',
                 'Audit complete. Nothing was changed.'
             )
-            MustNotContain = @('Audit did not complete', 'DIAGNOSTIC:')
-            ReviewContains = @('**Overall: PASS**')
+            MustNotContain = @(
+                'Audit did not complete',
+                'DIAGNOSTIC:',
+                'Execution role audit: PASS'
+            )
+            ReviewContains = @(
+                '**Overall: REVIEW**',
+                'FAIL: 0. REVIEW: 1.',
+                '| Attached managed policies | REVIEW |',
+                'No managed policy is attached'
+            )
         })
 
     # --- C: several attached policies ---------------------------------------

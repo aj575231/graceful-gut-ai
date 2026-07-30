@@ -2807,6 +2807,73 @@ def test_the_many_inline_scenario_records_more_than_one_finding() -> None:
     assert "ExpectedExit   = 0" in block, "two REVIEWs is still not a failed run"
 
 
+#: The two "the role is missing something" branches, and the finding each records.
+#: Both printed without recording until the single-collection rewrite.
+ZERO_POLICY_BRANCHES = (
+    ("Get-AttachedPolicyDocuments", "No managed policy is attached"),
+    ("Get-InlinePolicyDocuments", "No inline policy is present"),
+)
+
+
+@pytest.mark.parametrize(("function", "title"), ZERO_POLICY_BRANCHES)
+def test_an_empty_policy_list_records_a_finding_rather_than_printing_one(
+    function: str, title: str
+) -> None:
+    """Why a zero-policy scenario must expect REVIEW and not PASS.
+
+    These two branches are the reason, and asserting on them is what keeps the
+    harness expectation and the script from drifting apart again: if either ever
+    goes back to printing without recording, this fails here rather than on an
+    administrator's machine.
+    """
+    body = FUNCTION_BODIES[function]
+
+    assert f"Add-Finding -Severity 'Review' -Title '{title}'" in body, (
+        f"{function} does not record '{title}' as a finding"
+    )
+
+
+def test_no_zero_policy_scenario_expects_an_overall_pass() -> None:
+    """Scenario B asserted ``**Overall: PASS**`` and failed on AJ's 2026-07-30
+    harness run — the one failed assertion in the whole run.
+
+    The expectation was correct for the script it was written against: the
+    zero-policy branch printed a REVIEW and recorded nothing, so the review file
+    really did say PASS. That made B a scenario that *pinned the
+    terminal/review disagreement in place* rather than catching it, and it was
+    the only one whose fixture exposed that disagreement without an unrecognised
+    policy name being involved.
+
+    A role that is missing a policy the audit expects produces a REVIEW in both
+    artefacts or the two do not agree, which is the whole point of the rewrite.
+    """
+    blocks = harness_scenario_blocks()
+    empty_list = re.compile(r"'iam_list-(?:attached-)?role-policies'\s*=\s*'\[\]'")
+
+    zero = {name: block for name, block in blocks.items() if empty_list.search(block)}
+    assert len(zero) == 2, f"expected the two zero-policy scenarios, got {sorted(zero)}"
+
+    for name, block in zero.items():
+        required = block[block.index("ReviewContains") :]
+        prohibited = block[block.index("MustNotContain") :]
+        prohibited = prohibited[: prohibited.index("ReviewContains")]
+
+        assert "**Overall: PASS**" not in block, (
+            f"{name} feeds an empty policy list and still expects an overall PASS"
+        )
+        assert "**Overall: REVIEW**" in required, f"{name} does not expect a REVIEW"
+        assert "FAIL: 0. REVIEW: 1." in required, (
+            f"{name} does not require the finding to be counted in the review"
+        )
+        assert "'Execution role audit: REVIEW'" in block, (
+            f"{name} does not require the REVIEW verdict in the terminal"
+        )
+        assert "'Execution role audit: PASS'" in prohibited, (
+            f"{name} tolerates a PASS verdict in the terminal"
+        )
+        assert "ExpectedExit   = 0" in block, f"{name} is not a completed run"
+
+
 @pytest.mark.parametrize(
     ("scenario", "following"),
     [
