@@ -415,7 +415,7 @@ function Get-Scenarios {
                 'No least-privilege finding',
                 'Audit complete. Nothing was changed.'
             )
-            MustNotContain = @('Audit did not complete')
+            MustNotContain = @('Audit did not complete', 'DIAGNOSTIC:')
             ReviewContains = @('**Overall: PASS**', 'AWSLambdaBasicExecutionRole')
         })
 
@@ -432,7 +432,7 @@ function Get-Scenarios {
                 'No managed policy is attached',
                 'Audit complete. Nothing was changed.'
             )
-            MustNotContain = @('Audit did not complete')
+            MustNotContain = @('Audit did not complete', 'DIAGNOSTIC:')
             ReviewContains = @('**Overall: PASS**')
         })
 
@@ -452,7 +452,7 @@ function Get-Scenarios {
                 'Resolved customer-managed policy: GracefulGutAI-ExtraLogging',
                 'Log write on unrestricted resource'
             )
-            MustNotContain = @('Audit did not complete')
+            MustNotContain = @('Audit did not complete', 'DIAGNOSTIC:')
             ReviewContains = @('**Overall: REVIEW**', 'GracefulGutAI-ExtraLogging')
         })
 
@@ -471,7 +471,8 @@ function Get-Scenarios {
             MustContain    = @(
                 "did not include the required field 'State'",
                 'Audit did not complete. No review was written.',
-                'Nothing was changed'
+                'Nothing was changed',
+                "DIAGNOSTIC: stage='Function'"
             )
             MustNotContain = @(
                 'Audit complete',
@@ -495,7 +496,8 @@ function Get-Scenarios {
             ExpectedCalls  = 2
             MustContain    = @(
                 "did not include the required field 'Role'",
-                'Audit did not complete. No review was written.'
+                'Audit did not complete. No review was written.',
+                "DIAGNOSTIC: stage='Function'"
             )
             MustNotContain = @(
                 'Audit complete',
@@ -520,7 +522,7 @@ function Get-Scenarios {
                 'Execution role audit: FAIL',
                 'Audit complete. Nothing was changed.'
             )
-            MustNotContain = @('Audit did not complete')
+            MustNotContain = @('Audit did not complete', 'DIAGNOSTIC:')
             ReviewContains = @(
                 '**Overall: FAIL**',
                 'Scope Resource to the one expected secret ARN.'
@@ -768,9 +770,36 @@ try {
             Write-Pass 'no account ID in the terminal output'
         }
 
+        # --- the child's own failure diagnostic ------------------------------
+        #
+        # The audit prints one DIAGNOSTIC line when it dies, naming the stage, the
+        # function, and the line. Three administrator runs were spent turning a bare
+        # exception message into a location, so it is lifted to the top of the
+        # failure report rather than left for someone to find in the captured
+        # output. It is also checked for the one thing that could make it unsafe
+        # to paste: an absolute path. The stage and function are literals from the
+        # audit script and the line is an offset into it, so a path separator here
+        # would mean the audit's own guard had failed.
+        [string[]]$diagnostics = @(
+            @($run.Output -split "`n") |
+                ForEach-Object { [string]$_ } |
+                Where-Object { $_ -match 'DIAGNOSTIC:' } |
+                ForEach-Object { $_.Trim() }
+        )
+
+        foreach ($diagnostic in $diagnostics) {
+            if ($diagnostic -match '[\\/]') {
+                Add-Failure -Scenario $name `
+                    -Reason 'the failure diagnostic carried a path'
+            }
+        }
+
         # A failing scenario prints what it saw, because a bare "expected 0, got 1"
         # is not enough to act on. A passing one stays quiet unless asked.
         if (-not $ShowOutput -and $script:Failures.Count -gt $failuresBefore) {
+            foreach ($diagnostic in $diagnostics) {
+                Write-Host "    $diagnostic" -ForegroundColor Yellow
+            }
             Write-Host '    --- captured output ---' -ForegroundColor DarkGray
             Write-Host $run.Output -ForegroundColor DarkGray
         }

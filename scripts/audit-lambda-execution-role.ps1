@@ -279,6 +279,12 @@ $script:ExitCode = 0
 $script:StagesCompleted = $false
 $script:PermissionFindings = New-Object System.Collections.Generic.List[object]
 
+#: The stage currently running, for the failure diagnostic. Write-Section is the
+#: single place a stage begins, so it is the single place this is set. The value
+#: is always a literal from this file -- never a path, an identifier, or a value
+#: read from AWS -- which is what makes it safe to print on failure.
+$script:Stage = 'startup'
+
 # ---------------------------------------------------------------------------
 # Outcome vocabulary -- the single place these words can be produced
 # ---------------------------------------------------------------------------
@@ -349,6 +355,11 @@ function Write-Finding {
 
 function Write-Section {
     param([Parameter(Mandatory = $true)][string]$Title)
+
+    # Every stage announces itself here, so this is where the run records which
+    # stage it is in. A failure diagnostic that cannot name the stage is a
+    # failure report that costs another administrator run to localise.
+    $script:Stage = $Title
 
     Write-Host ''
     Write-Host $Title -ForegroundColor Cyan
@@ -438,6 +449,66 @@ function Stop-Run {
     param([Parameter(Mandatory = $true)][string]$Message)
 
     throw (Hide-Sensitive -Text $Message)
+}
+
+function Get-SafeDiagnostic {
+    <#
+    .SYNOPSIS
+        One line naming where a run died, carrying nothing that must not be seen.
+
+    .DESCRIPTION
+        The exception message alone is not enough to localise a failure. Three
+        administrator runs have now been spent turning a bare message into a
+        location, and the third one -- "Argument types do not match" -- names
+        neither the call nor the stage, because .NET method-binding failures never
+        do. Three facts fix that: the stage, the function, and the line.
+
+        What it deliberately does not carry is as important. A stack trace is the
+        obvious source for a function name, and it is also the fastest way to put
+        an absolute user path into a report: PowerShell renders each frame as
+        "at <function>, <full script path>: line <n>". So only the text before the
+        first comma is taken, and it is discarded entirely if it contains a path
+        separator or a colon. The line number comes from InvocationInfo, which is
+        an offset into this file and not a location on anyone's disk.
+
+        The stage is a literal from this script, set by Write-Section. The
+        exception type is a .NET type name. Neither can carry an account ID, ARN,
+        secret identifier, URL, credential, or environment value -- and the whole
+        line still goes through Hide-Sensitive, because a guarantee that is only
+        argued is weaker than one that is also enforced.
+    #>
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $exceptionType = 'unknown'
+    if ($null -ne $ErrorRecord.Exception) {
+        $exceptionType = [string]$ErrorRecord.Exception.GetType().FullName
+    }
+
+    $stage = [string]$script:Stage
+    if ([string]::IsNullOrWhiteSpace($stage)) { $stage = 'unknown' }
+
+    $line = 0
+    if ($null -ne $ErrorRecord.InvocationInfo) {
+        $line = [int]$ErrorRecord.InvocationInfo.ScriptLineNumber
+    }
+
+    $functionName = 'unknown'
+    $trace = [string]$ErrorRecord.ScriptStackTrace
+    if (-not [string]::IsNullOrWhiteSpace($trace)) {
+        $frame = [string](@($trace -split "`n")[0])
+        $match = [regex]::Match($frame.Trim(), '^at\s+([^,]+)')
+        if ($match.Success) {
+            $candidate = [string]$match.Groups[1].Value
+            # A frame name is a function name. Anything carrying a path
+            # separator or a drive colon is a path, and a path is dropped.
+            if ($candidate -notmatch '[\\/:]') { $functionName = $candidate.Trim() }
+        }
+    }
+
+    $diagnostic = "DIAGNOSTIC: stage='$stage' function='$functionName' " +
+    "line=$line exception=$exceptionType"
+
+    return (Hide-Sensitive -Text $diagnostic)
 }
 
 # ---------------------------------------------------------------------------
@@ -1910,6 +1981,47 @@ function Test-ReviewRedacted {
 }
 
 function New-ReviewFile {
+    <#
+    .SYNOPSIS
+        Render the review, scan it, and write it. Host-independent by construction.
+
+    .DESCRIPTION
+        The third administrator run reached this function with every verdict
+        already correct and died here with "Argument types do not match" -- a
+        .NET method-binding failure, raised when an overloaded method is handed an
+        argument whose runtime type is not the one the chosen overload takes. On
+        Windows PowerShell 5.1 the usual way that happens in a script like this is
+        a collection: a generic List, or a [psobject]-wrapped array, crossing a
+        function boundary and then being formatted, joined, or passed to a .NET
+        call that has more than one overload to choose between.
+
+        So this function assumes nothing about the shape of what it is given. The
+        stage results arrive as generic Lists inside [psobject] wrappers, and the
+        first thing that happens to each of them is a conversion to a plain array
+        with an explicit element cast. Everything after that point is a [string],
+        an [int], or an [object[]] -- shapes that bind identically on 5.1 and 7.
+
+        Three specific hazards are removed rather than worked around:
+
+          * The finished review is joined from an explicit [string[]], never from
+            a generic List. `-join` is PowerShell's own operator and does not go
+            through .NET overload resolution at all, which is why it is used here
+            in preference to [string]::Join -- that one has four overloads and
+            picking between them is exactly the failure mode above.
+          * The category table no longer indexes the ordered dictionary. An
+            OrderedDictionary exposes two Item accessors, one taking an Int32 and
+            one taking an Object, and resolving between them through a [psobject]
+            property is a choice this function should not have to make. Its
+            enumerator yields the key and the value together, so there is nothing
+            to resolve.
+          * No `@($genericList)` survives here. `@(...)` cannot see through a
+            [psobject] wrapper -- that is what broke the second run -- so a cast
+            or an explicit element-by-element conversion does the work instead.
+
+        Nothing about redaction is relaxed to make the write succeed: the scan
+        still runs on the finished text, and still means no file rather than a
+        warned-about one.
+    #>
     param(
         [Parameter(Mandatory = $true)]$Trust,
         [Parameter(Mandatory = $true)]$Permissions,
@@ -1923,9 +2035,26 @@ function New-ReviewFile {
         Stop-Run -Message 'Refusing to write a review before every audit stage completed.'
     }
 
-    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $fileStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $path = Join-Path $Directory "phase1g-execution-role-audit-$fileStamp.md"
+    $stamp = [string](Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    $fileStamp = [string](Get-Date -Format 'yyyyMMdd-HHmmss')
+    [string]$path = Join-Path -Path $Directory -ChildPath "phase1g-execution-role-audit-$fileStamp.md"
+
+    # --- Normalise every collection before a single line is rendered --------
+    #
+    # This is the whole correction. Each stage result is turned into a plain
+    # [object[]] here and nowhere else, so no generic List and no [psobject]
+    # wrapper reaches the formatting, joining, or file-writing below.
+
+    [object[]]$policyRows = @()
+    if ($null -ne $Policies) { $policyRows = [object[]]$Policies }
+
+    [object[]]$trustFindings = @()
+    if ($null -ne $Trust.Findings) { $trustFindings = [object[]]$Trust.Findings }
+
+    [object[]]$permissionFindings = @()
+    if ($null -ne $Permissions.Findings) { $permissionFindings = [object[]]$Permissions.Findings }
+
+    [object[]]$allFindings = $trustFindings + $permissionFindings
 
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('# Phase 1G - Lambda execution role audit')
@@ -1960,37 +2089,41 @@ function New-ReviewFile {
     $lines.Add('')
     $lines.Add('| Policy | Type | Version |')
     $lines.Add('| --- | --- | --- |')
-    foreach ($policy in $Policies) {
-        $lines.Add("| $($policy.Name) | $($policy.Kind) | $($policy.VersionId) |")
+    foreach ($policy in $policyRows) {
+        $lines.Add("| $([string]$policy.Name) | $([string]$policy.Kind) | $([string]$policy.VersionId) |")
     }
-    if (@($Policies).Count -eq 0) {
+    if ($policyRows.Count -eq 0) {
         $lines.Add('| (none) | - | - |')
     }
     $lines.Add('')
-    $lines.Add("Secret encryption: $($Secret.KeyDescription).")
+    $lines.Add("Secret encryption: $([string]$Secret.KeyDescription).")
     $lines.Add('')
 
     $lines.Add('## Permission categories')
     $lines.Add('')
     $lines.Add('| Category | Actions |')
     $lines.Add('| --- | --- |')
-    foreach ($category in $Permissions.CategoryCounts.Keys) {
-        $lines.Add("| $category | $([int]$Permissions.CategoryCounts[$category]) |")
+    # The enumerator hands over the key and the value together, so the ordered
+    # dictionary is never indexed. See the note on this function about why that
+    # matters on Windows PowerShell 5.1.
+    foreach ($entry in $Permissions.CategoryCounts.GetEnumerator()) {
+        $lines.Add("| $([string]$entry.Key) | $([int]$entry.Value) |")
     }
     $lines.Add('')
-    $lines.Add("Statements: $($Permissions.StatementCount). Actions: $($Permissions.ActionCount). Deny statements: $($Permissions.DenyCount).")
+    $lines.Add("Statements: $([int]$Permissions.StatementCount). Actions: $([int]$Permissions.ActionCount). Deny statements: $([int]$Permissions.DenyCount).")
     $lines.Add('')
 
-    $allFindings = New-Object System.Collections.Generic.List[object]
-    foreach ($finding in $Trust.Findings) { $allFindings.Add($finding) }
-    foreach ($finding in $Permissions.Findings) { $allFindings.Add($finding) }
-
-    $failCount = @($allFindings | Where-Object { $_.Severity -eq 'Fail' }).Count
-    $reviewCount = @($allFindings | Where-Object { $_.Severity -eq 'Review' }).Count
+    $failCount = 0
+    $reviewCount = 0
+    foreach ($finding in $allFindings) {
+        $severity = [string]$finding.Severity
+        if ($severity -eq 'Fail') { $failCount++ }
+        elseif ($severity -eq 'Review') { $reviewCount++ }
+    }
 
     $lines.Add('## Findings')
     $lines.Add('')
-    $lines.Add("$(ConvertTo-Classification -Severity 'Fail'): $failCount. $(ConvertTo-Classification -Severity 'Review'): $reviewCount.")
+    $lines.Add("$(ConvertTo-Classification -Severity 'Fail'): $([int]$failCount). $(ConvertTo-Classification -Severity 'Review'): $([int]$reviewCount).")
     $lines.Add('')
 
     if ($allFindings.Count -eq 0) {
@@ -2008,8 +2141,14 @@ function New-ReviewFile {
         }
         $lines.Add('')
 
-        $corrections = @($allFindings |
-                Where-Object { (Test-HasProperty -Object $_ -Name 'Correction') -and -not [string]::IsNullOrWhiteSpace($_.Correction) })
+        $correctionList = New-Object System.Collections.Generic.List[object]
+        foreach ($finding in $allFindings) {
+            if ((Test-HasProperty -Object $finding -Name 'Correction') -and
+                -not [string]::IsNullOrWhiteSpace([string]$finding.Correction)) {
+                $correctionList.Add($finding)
+            }
+        }
+        [object[]]$corrections = $correctionList.ToArray()
 
         if ($corrections.Count -gt 0) {
             $lines.Add('## Least-privilege corrections')
@@ -2034,7 +2173,14 @@ function New-ReviewFile {
     $lines.Add('- No S3, DynamoDB, SQS, SNS, EC2, or networking permission.')
     $lines.Add('')
 
-    $content = ($lines -join [Environment]::NewLine)
+    # The review-line boundary. Every line becomes a [string] one at a time, the
+    # collection becomes a [string[]], and the text is produced with PowerShell's
+    # own -join operator. Nothing here is a generic List, a [psobject]-wrapped
+    # array, or an overloaded .NET formatting call.
+    [string[]]$reviewLines = @(
+        $lines | ForEach-Object { [string]$_ }
+    )
+    [string]$content = $reviewLines -join [Environment]::NewLine
 
     if (-not (Test-ReviewRedacted -Content $content)) {
         Stop-Run -Message @"
@@ -2047,7 +2193,7 @@ verdict from the terminal output instead.
     }
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($path, $content, $utf8NoBom)
+    [System.IO.File]::WriteAllText([string]$path, [string]$content, [System.Text.Encoding]$utf8NoBom)
 
     $script:ReviewFile = $path
     return $path
@@ -2110,6 +2256,7 @@ somewhere outside the repository and re-run.
 catch {
     Write-Host ''
     [Console]::Error.WriteLine((Hide-Sensitive -Text $_.Exception.Message))
+    [Console]::Error.WriteLine((Get-SafeDiagnostic -ErrorRecord $_))
     $script:ExitCode = 1
 }
 

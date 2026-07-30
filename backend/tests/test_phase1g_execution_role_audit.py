@@ -1517,7 +1517,15 @@ SAFE_ASSIGNMENT_PATTERNS = (
     re.compile(r"=\s*@\("),
     re.compile(r"=\s*New-Object\s+System\.Collections\.Generic\.List"),
     re.compile(r"=\s*New-Object\s+System\.Collections\.ArrayList"),
+    # A type-constrained declaration is stronger than a normalising wrapper, not
+    # weaker: PowerShell coerces on this assignment and on every later one, so
+    # the variable cannot become a scalar afterwards. This is the shape the
+    # review path was rewritten into after the third administrator run.
+    re.compile(r"^\s*\[(?:object|string)\[\]\]\s*\$"),
 )
+
+#: An assignment may carry a type constraint in front of the variable.
+TYPE_CONSTRAINT = r"(?:\[[A-Za-z0-9_.\[\]]+\]\s*)?"
 
 
 def function_bodies(code: str) -> dict[str, str]:
@@ -1624,7 +1632,9 @@ def test_every_count_receiver_is_normalised_or_a_real_collection() -> None:
         assignments = [
             line
             for line in scope.splitlines()
-            if re.search(r"^\s*" + re.escape(receiver) + r"\s*=[^=]", line)
+            if re.search(
+                r"^\s*" + TYPE_CONSTRAINT + re.escape(receiver) + r"\s*=[^=]", line
+            )
         ]
 
         if not assignments:
@@ -2675,3 +2685,323 @@ def test_the_harness_does_not_shadow_the_audit_as_the_thing_being_tested() -> No
     own copy of the audit would pass while the real one stayed broken."""
     assert "Join-Path $PSScriptRoot 'audit-lambda-execution-role.ps1'" in RUNTIME_CODE
     assert "Audit script not found next to this harness" in RUNTIME_TEXT
+
+
+# ---------------------------------------------------------------------------
+# The review renderer -- the third administrator failure
+# ---------------------------------------------------------------------------
+#
+# The third runtime harness run reached every correct verdict and then died in
+# review generation with "Argument types do not match". That message is a .NET
+# method-binding failure: an overloaded method was handed an argument whose
+# runtime type was not the one the chosen overload takes. Under Windows
+# PowerShell 5.1 the usual source in a script this shape is a collection -- a
+# generic List, or an array inside the [psobject] wrapper that -NoEnumerate
+# produces -- crossing a function boundary and then being formatted, joined, or
+# passed to an overloaded .NET call.
+#
+# The harness itself exonerates most of the candidates. It runs on the same host
+# and, before any scenario starts, already calls [System.IO.Path]::GetFullPath,
+# String.StartsWith(String, StringComparison), List[string].Add, and
+# [System.IO.File]::WriteAllText with a New-Object UTF8Encoding -- all of which
+# worked. What it never did was join a *generic List* or index an ordered
+# dictionary reached through a [psobject]-wrapped property, and both of those
+# were unique to the audit's review path.
+#
+# So the correction is not a guess at one line. Every collection the renderer
+# touches is converted to a plain, explicitly typed array before a single line is
+# rendered, and the rules below hold that shape in place.
+
+#: New-ReviewFile is the last function in the file, so its split body runs on
+#: into the script body. Cut it back at the main-body anchor.
+REVIEW_BODY = FUNCTION_BODIES["New-ReviewFile"]
+REVIEW_BODY = REVIEW_BODY[: REVIEW_BODY.index(MAIN_ANCHOR)]
+
+#: The review path is the renderer plus the main-body section that calls it.
+REVIEW_MAIN = main_body(AUDIT_CODE)
+REVIEW_MAIN = REVIEW_MAIN[REVIEW_MAIN.index("Write-Section 'Review'") :]
+REVIEW_PATH = REVIEW_BODY + REVIEW_MAIN
+
+
+def test_the_review_path_scan_is_not_vacuous() -> None:
+    """Both halves must actually be found, or every rule below passes on air."""
+    assert "$reviewLines" in REVIEW_BODY
+    assert "WriteAllText" in REVIEW_BODY
+    assert "New-ReviewFile -Trust" in REVIEW_PATH
+    assert len(REVIEW_BODY.splitlines()) > 40
+
+
+def test_the_final_review_lines_are_an_explicit_string_array() -> None:
+    """Requirement 5. The collection that is joined is a [string[]], and each of
+    its elements was converted to [string] one at a time on the way in."""
+    assert re.search(r"\[string\[\]\]\s*\$reviewLines\s*=\s*@\(", REVIEW_BODY), (
+        "the review lines are not stored as an explicit [string[]]"
+    )
+    assert re.search(
+        r"\$lines\s*\|\s*ForEach-Object\s*\{\s*\[string\]\$_\s*\}", REVIEW_BODY
+    ), "review lines are not converted to [string] individually"
+
+
+def test_the_review_text_is_produced_with_the_join_operator() -> None:
+    """PowerShell's -join is not a .NET call and has no overloads to resolve
+    between, which is the entire reason it is used here."""
+    assert re.search(
+        r"\[string\]\$content\s*=\s*\$reviewLines\s+-join\s+\[Environment\]::NewLine",
+        REVIEW_BODY,
+    ), "the review text is not joined from the normalised [string[]]"
+
+
+def test_no_generic_list_is_joined_in_the_review_path() -> None:
+    """The shape that failed: ``$lines -join ...`` where ``$lines`` is a
+    ``List[string]``. The join receiver must be the normalised array."""
+    joins = re.findall(r"(\$[A-Za-z_][A-Za-z0-9_]*)\s+-join\b", REVIEW_PATH)
+
+    assert joins, "the review path no longer joins anything"
+    for receiver in joins:
+        assert receiver == "$reviewLines", (
+            f"{receiver} is joined in the review path; only $reviewLines may be"
+        )
+
+
+def test_string_join_is_not_used_anywhere_in_the_script() -> None:
+    """[string]::Join has four overloads -- string[], object[], IEnumerable<T>,
+    and the ranged one -- and picking between them with a collection whose
+    runtime type is not verified is exactly the failure being corrected."""
+    assert "[string]::Join" not in AUDIT_CODE
+    assert "[System.String]::Join" not in AUDIT_CODE
+
+
+def test_no_generic_list_is_wrapped_in_an_array_subexpression_in_the_review() -> None:
+    """``@($genericList)`` cannot see through a [psobject] wrapper -- that is what
+    broke the second administrator run -- so the review path must not use it.
+
+    Every generic List built in the renderer is converted with an explicit cast
+    or with .ToArray() instead.
+    """
+    generic_lists = set(
+        re.findall(
+            r"(\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*New-Object\s+System\.Collections\.Generic\.List",
+            REVIEW_PATH,
+        )
+    )
+
+    assert generic_lists, "the scan found no generic List to check"
+    for name in generic_lists:
+        assert f"@({name})" not in REVIEW_PATH, f"@({name}) survives in the review path"
+
+
+def test_the_stage_results_are_normalised_before_anything_is_rendered() -> None:
+    """Requirement 6. Each collection arriving from a stage is turned into a
+    plain [object[]] once, at the top, and nothing downstream sees the original.
+    """
+    for name, source in (
+        ("$policyRows", "$Policies"),
+        ("$trustFindings", "$Trust.Findings"),
+        ("$permissionFindings", "$Permissions.Findings"),
+    ):
+        pattern = (
+            re.escape(name) + r"\s*=\s*\[object\[\]\]" + re.escape(source) + r"\s*\}"
+        )
+        assert re.search(pattern, REVIEW_BODY), (
+            f"{name} is not normalised from {source} with an [object[]] cast"
+        )
+
+    assert (
+        "[object[]]$allFindings = $trustFindings + $permissionFindings" in REVIEW_BODY
+    )
+
+
+def test_the_normalisers_handle_the_null_case_before_casting() -> None:
+    """``[object[]]$null`` is $null, not an empty array, so the guard is what
+    makes the zero case behave. Same lesson as Get-AsArray."""
+    for name in ("$policyRows", "$trustFindings", "$permissionFindings"):
+        assert f"[object[]]{name} = @()" in REVIEW_BODY, (
+            f"{name} has no empty-array default"
+        )
+
+    assert REVIEW_BODY.count("if ($null -ne ") >= 3
+
+
+def test_the_ordered_dictionary_is_no_longer_indexed_in_the_review() -> None:
+    """An OrderedDictionary exposes two Item accessors -- one Int32, one Object --
+    and resolving between them through a [psobject]-wrapped property is a choice
+    the renderer should not have to make. Its enumerator yields both halves."""
+    assert "$Permissions.CategoryCounts[" not in REVIEW_BODY
+    assert "$Permissions.CategoryCounts.Keys" not in REVIEW_BODY
+    assert (
+        "foreach ($entry in $Permissions.CategoryCounts.GetEnumerator())" in REVIEW_BODY
+    )
+    assert (
+        '$lines.Add("| $([string]$entry.Key) | $([int]$entry.Value) |")' in REVIEW_BODY
+    )
+
+
+def test_the_classifier_still_owns_the_category_counts() -> None:
+    """The correction is confined to rendering. The permission classifier still
+    builds the ordered dictionary and still counts into it by key."""
+    classifier = FUNCTION_BODIES["Test-PolicyStatements"]
+
+    assert "$categoryCounts = [ordered]@{}" in classifier
+    assert "$categoryCounts[$category]" in classifier
+
+
+def test_no_format_operator_is_used_in_the_review_path() -> None:
+    """Requirement 13. The -f operator and [string]::Format both bind through
+    .NET overload resolution and both mis-bind a [psobject]-wrapped array. The
+    renderer uses string interpolation, which does neither."""
+    assert not re.search(r"['\")\]]\s+-f\s+", REVIEW_PATH), (
+        "a -f format operation survives in the review path"
+    )
+    assert "::Format(" not in REVIEW_PATH
+
+
+def test_every_interpolated_review_value_is_explicitly_typed() -> None:
+    """A subexpression inside a review line must produce a [string] or an [int],
+    never whatever the property happened to hold. ConvertTo-Classification is
+    exempt: it returns one of three literals and nothing else."""
+    untyped = []
+
+    for line in REVIEW_BODY.splitlines():
+        if "$lines.Add(" not in line:
+            continue
+        for expression in re.findall(r"\$\((.*?)\)(?=[^)]*\")", line):
+            if expression.startswith("ConvertTo-Classification"):
+                continue
+            if expression.startswith("[string]") or expression.startswith("[int]"):
+                continue
+            untyped.append(line.strip())
+
+    assert not untyped, "untyped interpolation in a review line:\n" + "\n".join(untyped)
+
+
+def test_the_file_write_receives_explicitly_typed_arguments() -> None:
+    """WriteAllText has a two-argument and a three-argument overload. Naming the
+    type of all three arguments leaves nothing for the binder to decide."""
+    assert (
+        "[System.IO.File]::WriteAllText([string]$path, [string]$content, "
+        "[System.Text.Encoding]$utf8NoBom)" in REVIEW_BODY
+    )
+
+
+def test_the_review_path_does_not_use_write_output_noenumerate() -> None:
+    """Requirement 7. -NoEnumerate is what put the [psobject] wrapper into the
+    collection path in the first place; it must not be the fix here."""
+    assert "-NoEnumerate" not in REVIEW_PATH
+
+
+def test_the_normalisation_is_explained_where_it_lives() -> None:
+    """A reader who deletes a cast because it looks redundant reproduces the
+    failure. The reason has to be next to the code, not only in a report.
+
+    ``REVIEW_BODY`` is the comment-stripped copy, so the explanation is looked for
+    in the raw text of the same function.
+    """
+    raw = AUDIT_TEXT[AUDIT_TEXT.index("function New-ReviewFile") :]
+    raw = raw[: raw.index(MAIN_ANCHOR)]
+
+    assert "Argument types do not match" in raw, (
+        "the renderer does not name the failure it was rewritten for"
+    )
+    assert "overload" in raw.lower()
+    assert "psobject" in raw.lower()
+
+
+# --- The failure diagnostic -------------------------------------------------
+
+
+def test_the_script_emits_a_diagnostic_when_a_run_dies() -> None:
+    """Requirement 10. Two administrator runs were spent turning a bare exception
+    message into a location. The third one should not have to be."""
+    main = main_body(AUDIT_CODE)
+
+    assert "Get-SafeDiagnostic -ErrorRecord $_" in main
+    assert "function Get-SafeDiagnostic" in AUDIT_CODE
+
+
+def test_the_diagnostic_names_the_stage_the_function_the_line_and_the_type() -> None:
+    diagnostic = FUNCTION_BODIES["Get-SafeDiagnostic"]
+
+    assert "$ErrorRecord.Exception.GetType().FullName" in diagnostic
+    assert "$ErrorRecord.InvocationInfo.ScriptLineNumber" in diagnostic
+    assert "$script:Stage" in diagnostic
+    assert "$ErrorRecord.ScriptStackTrace" in diagnostic
+
+    # The literal is split across two source lines, so the four facts are
+    # checked individually rather than as one run of text.
+    for fact in (
+        "stage='$stage'",
+        "function='$functionName'",
+        "line=$line",
+        "exception=$exceptionType",
+    ):
+        assert fact in diagnostic, f"the diagnostic does not carry {fact}"
+
+
+def test_the_diagnostic_drops_anything_that_looks_like_a_path() -> None:
+    """PowerShell renders a stack frame as "at <function>, <full path>: line n".
+    Taking the frame verbatim would put an absolute user path in the output."""
+    diagnostic = FUNCTION_BODIES["Get-SafeDiagnostic"]
+
+    assert "'^at\\s+([^,]+)'" in diagnostic, "the frame is not split at the comma"
+    assert "-notmatch '[\\\\/:]'" in diagnostic, (
+        "a path-shaped frame name is not rejected"
+    )
+
+
+def test_the_diagnostic_is_masked_before_it_is_printed() -> None:
+    """Belt and braces: every input is argued to be safe, and the whole line still
+    goes through the masker."""
+    diagnostic = FUNCTION_BODIES["Get-SafeDiagnostic"]
+
+    assert "return (Hide-Sensitive -Text $diagnostic)" in diagnostic
+
+
+def test_the_stage_is_recorded_only_where_a_stage_begins() -> None:
+    """One writer. A stage name set in two places drifts from the truth."""
+    writes = re.findall(r"\$script:Stage\s*=", AUDIT_CODE)
+
+    assert len(writes) == 2, (
+        f"expected an initialiser and one writer, found {len(writes)}"
+    )
+    assert "$script:Stage = 'startup'" in AUDIT_CODE
+    assert "$script:Stage = $Title" in FUNCTION_BODIES["Write-Section"]
+
+
+def test_every_stage_name_is_a_literal_in_this_script() -> None:
+    """The diagnostic prints the stage, so the stage must never be a value read
+    from AWS, an identifier, or a path."""
+    titles = re.findall(r"Write-Section\s+'([^']+)'", AUDIT_CODE)
+
+    assert len(titles) >= 9, f"only found {len(titles)} stages"
+    for title in titles:
+        assert re.fullmatch(r"[A-Za-z][A-Za-z ]*", title), (
+            f"suspicious stage name: {title}"
+        )
+
+
+def test_the_harness_surfaces_and_checks_the_child_diagnostic() -> None:
+    """Requirement 10, on the harness side: it lifts the diagnostic to the top of
+    a failure report and fails the scenario if the line carries a path."""
+    assert "$_ -match 'DIAGNOSTIC:'" in RUNTIME_CODE
+    assert "the failure diagnostic carried a path" in RUNTIME_TEXT
+    assert re.search(r"\[string\[\]\]\$diagnostics\s*=\s*@\(", RUNTIME_CODE)
+
+
+def test_the_completed_scenarios_require_no_diagnostic_at_all() -> None:
+    """The regression guard for this failure. A, B, C, and F reached correct
+    verdicts and then died in review generation; if that recurs they will print a
+    diagnostic, and printing one is now a scenario failure."""
+    completed = re.findall(
+        r"MustNotContain = @\('Audit did not complete', 'DIAGNOSTIC:'\)", RUNTIME_CODE
+    )
+
+    assert len(completed) == 4, (
+        "expected the four completed scenarios to reject a diagnostic, "
+        f"found {len(completed)}"
+    )
+
+
+def test_the_incomplete_scenarios_require_the_diagnostic() -> None:
+    """D and E stop on purpose, so they must produce one -- otherwise the guard
+    above could pass with the diagnostic never being emitted at all."""
+    assert RUNTIME_CODE.count("\"DIAGNOSTIC: stage='Function'\"") == 2
