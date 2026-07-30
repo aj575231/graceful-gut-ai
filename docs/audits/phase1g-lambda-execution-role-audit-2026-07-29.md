@@ -1621,7 +1621,9 @@ Phase 1G stays open.
 
 **Branch:** `phase1g-lambda-execution-role-audit`
 **Starting commit (this update):** `633be9f`
-**Implementation commit:** `01aa0c7` — *Reconcile Phase 1G policy naming and verdicts*
+**Implementation commits:**
+`01aa0c7` — *Reconcile Phase 1G policy naming and verdicts*
+`4bdd82e` — *Extend zero/one/many coverage to the inline policy list*
 **Report commit:** recorded in "Push — this update" below.
 
 ## What the two runs actually did
@@ -1787,7 +1789,7 @@ place it has to appear, from a single run:
 | --- | --- |
 | terminal output | the `REVIEW` line naming the policy |
 | REVIEW count | `FAIL: 0. REVIEW: 1.` in the review |
-| stages table | `| Inline policies | REVIEW |` |
+| stages table | the `Inline policies` row reads `REVIEW` |
 | findings table | the row |
 | corrections | the `## Least-privilege corrections` section |
 | overall verdict | `**Overall: REVIEW**`, and not `PASS` |
@@ -1800,11 +1802,48 @@ not have caught this, however many of them there were.
 Scenario A now also asserts the negative: a canonically named policy produces no
 `REVIEW` **anywhere** in the terminal output.
 
+## Scenarios H and I — zero/one/many for the inline list
+
+A follow-up review of the collection handling found the zero/one/many rule had
+only ever been applied to **attached managed** policies: zero in scenario B, one
+in A, many in C. Every runtime scenario fed the audit **exactly one** inline
+policy — G included. Two branches had therefore never executed at runtime, and
+both had just been converted from bare prints by the work above:
+
+- the **empty** inline list, which records a `REVIEW` of its own
+- a list long enough for **one stage to record more than one finding**
+
+The unit tests do cover inline policies for zero, one, and many. Normalisation
+was never the missing part — *execution* was. A converted branch that has never
+run is the shape of the last three failures in this phase, which is why this was
+worth closing before the rerun rather than after it.
+
+| Scenario | Feeds | Asserts |
+| --- | --- | --- |
+| **H** | zero inline policies | eight fake-CLI calls, `No inline policy is present` in terminal and review, overall `REVIEW`, exit `0`, and no `Resolved inline policy:` line at all |
+| **I** | two inline policies, neither recognised | both findings in terminal and review, `FAIL: 0. REVIEW: 2.`, an `Inline policies` stage row of `REVIEW`, exit `0` |
+
+Scenario I is the only one in which a single stage records two findings — exactly
+what the single-collection rewrite changed. The collection must accumulate the
+second rather than replace the first, `Get-StageSeverity` must aggregate both
+under one stage, and the review must render two rows. Both of I's documents are
+the clean secret grant, so the names stay the only thing wrong and a permission
+finding cannot inflate the count.
+
+Two tests pin the rule so the gap cannot quietly reopen: one asserts that **both**
+policy lists have a zero scenario and a several scenario, read from each
+scenario's own fixture rather than from a scenario count; the other asserts that
+I really does declare two policies, since checking only its expected counts would
+keep passing if the fixture were collapsed to one. Both were mutation-tested —
+removing the empty fixture, and collapsing the two-policy fixture, each fail the
+intended test and no other.
+
 ## What was deliberately left alone
 
 | Preserved | Status |
 | --- | --- |
 | Scenarios A–F | **Unchanged**, apart from A's added negative assertion |
+| Zero/one/many rule | **Extended**, not weakened — it now covers the inline list too (H, I) |
 | Read-only AWS allow-list | **Unchanged** |
 | Forbidden secret-value operations (`get-secret-value`, `batch-get-secret-value`) | **Unchanged** |
 | Query gate on what a call may ask for | **Unchanged** |
@@ -1819,8 +1858,8 @@ Scenario A now also asserts the negative: a canonically named policy produces no
 
 | Check | Result |
 | --- | --- |
-| `.venv/bin/python -m pytest -q` | **653 passed**, 2 warnings |
-| Phase 1G module | **252 passed** (was 238) |
+| `.venv/bin/python -m pytest -q` | **655 passed**, 2 warnings |
+| Phase 1G module | **254 passed** (was 238) |
 | `ruff check backend/` | **All checks passed** |
 | `ruff format --check backend/` | **18 files already formatted** |
 | `git diff --check` | **Clean** — no whitespace errors |
@@ -1839,8 +1878,8 @@ with a guard test that fails if the parser finds nothing.
 | File | Change |
 | --- | --- |
 | `scripts/audit-lambda-execution-role.ps1` | One finding collection; `Write-Finding` split into four writers; `Get-OverallSeverity` and `Get-StageSeverity` added; renderer reads the collection; stages table generated; expected inline-policy name corrected |
-| `scripts/test-audit-lambda-execution-role-runtime.ps1` | Scenario G added; base fixture uses the deployed policy name; scenario A asserts no spurious REVIEW |
-| `backend/tests/test_phase1g_execution_role_audit.py` | 14 net tests added; scenario rules re-driven off parsed blocks |
+| `scripts/test-audit-lambda-execution-role-runtime.ps1` | Scenarios G, H and I added; base fixture uses the deployed policy name; scenario A asserts no spurious REVIEW |
+| `backend/tests/test_phase1g_execution_role_audit.py` | 16 net tests added; scenario rules re-driven off parsed blocks |
 | `CLAUDE.md` | Inline-policy name corrected; old name marked superseded |
 | `infrastructure/README.md` | Same |
 | `docs/audits/phase1d-secrets-manager-2026-07-27.md` | Superseded marker only; original wording preserved |
@@ -1926,9 +1965,9 @@ git pull --ff-only
 .\scripts\test-audit-lambda-execution-role-runtime.ps1
 ```
 
-Exit `0` and "All scenarios passed" is the expected result; scenario G is the new
-one to watch, and it must report `REVIEW` in both the terminal and the review
-file.
+Exit `0` and "All scenarios passed" is the expected result. Scenarios G, H and I
+are the new ones to watch: each must report `REVIEW` in **both** the terminal and
+the review file, and I must report two findings in both.
 
 Then rerun the live audit with administrator credentials:
 
