@@ -3,11 +3,13 @@
 **Date:** 2026-07-29, updated 2026-07-29 after the first administrator run,
 updated 2026-07-30 after the second, again 2026-07-30 after the runtime harness
 run, and again 2026-07-30 after the first successful harness run and live audit
-**Outcome:** `PARTIAL` — tooling built, tested, committed, and **corrected four
+**Outcome:** `PARTIAL` — tooling built, tested, committed, and **corrected five
 times**: twice after failed administrator runs, once after a failed runtime
-harness run, and once after the first **successful** harness run and live audit
-exposed two defects that no crash could have surfaced. The corrected script has
-not been rerun, so Phase 1G is **not** closed.
+harness run, once after the first **successful** harness run and live audit
+exposed two defects that no crash could have surfaced, and once after a harness
+run whose single failed assertion turned out to be the harness's own. The **live
+audit has not been rerun** against the corrected script, so Phase 1G is **not**
+closed.
 **First administrator audit attempt:** **INCOMPLETE.** It failed partway through
 with a PowerShell collection-handling defect, wrote no review, and changed
 nothing. See "Update — first administrator run was INCOMPLETE" below.
@@ -25,6 +27,13 @@ secret-value operation was attempted, and no review was written inside the
 repository. See "Update 3 — runtime harness FAILED in review generation".
 **Second runtime harness run by AJ:** **PASSED.** All scenarios reached their
 expected verdicts, review generation worked, and no diagnostic was printed.
+**Third runtime harness run by AJ (Windows PowerShell 5.1):** **A and C–I passed
+completely; isolation passed; scenario B had one failed assertion**, and it was
+the harness's own stale `**Overall: PASS**` expectation, not an audit defect — B
+reached the correct `REVIEW` verdict and completed successfully. Corrected here;
+`scripts/audit-lambda-execution-role.ps1` was not changed. No real AWS call
+occurred and no secret-value operation was attempted. See "Harness run of
+2026-07-30" in Update 4.
 **First completed live execution-role audit:** **SUCCESS**, and it exposed two
 defects that no crash could have surfaced — the terminal and the written review
 disagreed about the same run, and the expected inline-policy name was one that
@@ -1624,6 +1633,7 @@ Phase 1G stays open.
 **Implementation commits:**
 `01aa0c7` — *Reconcile Phase 1G policy naming and verdicts*
 `4bdd82e` — *Extend zero/one/many coverage to the inline policy list*
+`b9bfd43` — *Correct the Phase 1G zero-policy harness expectation*
 **Report commit:** recorded in "Push — this update" below.
 
 ## What the two runs actually did
@@ -1838,6 +1848,87 @@ keep passing if the fixture were collapsed to one. Both were mutation-tested —
 removing the empty fixture, and collapsing the two-policy fixture, each fail the
 intended test and no other.
 
+## Harness run of 2026-07-30 — one failed assertion, and it was the harness's
+
+AJ ran the corrected harness on Windows PowerShell 5.1. **Scenarios A and C
+through I passed completely, and the isolation checks passed.** Scenario I
+demonstrated two `REVIEW` findings in **both** the terminal output and the
+written review — the accumulation case the single-collection rewrite exists to
+make work.
+
+The run had exactly one failed assertion:
+
+```
+Scenario B. zero attached managed policies
+FAIL review is missing: **Overall: PASS**
+```
+
+**The audit script was right and the harness was wrong.** Scenario B behaved
+correctly in every respect:
+
+| Observed | Result |
+| --- | --- |
+| Exit code | `0` |
+| Review written | one |
+| Terminal finding | `No managed policy is attached` |
+| Terminal verdict | `[REVIEW] Execution role audit: REVIEW` |
+| Review generation | completed, **no diagnostic** |
+| Fake-CLI calls | seven, all intercepted |
+| Account ID printed | **no** |
+
+A role with no managed policy writes no logs. That is a `REVIEW`, and a `REVIEW`
+is a request for an administrator's judgement rather than a failed run, so exit
+`0` is correct as well. `scripts/audit-lambda-execution-role.ps1` was **not
+changed** — inspection found no independent defect, and this report had already
+defined scenario B as allowing a `REVIEW` finding for the missing managed logging
+policy.
+
+### Why the expectation was stale rather than simply wrong
+
+`ReviewContains = @('**Overall: PASS**')` was **correct for the script it was
+written against**. The zero-policy branch used to *print* a `REVIEW` and record
+nothing, so the review file it produced genuinely did say `PASS`.
+
+That is the uncomfortable part, and it is worth stating plainly: scenario B was
+**pinning the terminal/review disagreement in place rather than catching it**. It
+was the only scenario whose fixture exposed that disagreement without an
+unrecognised policy name being involved — B had the defect in view the entire
+time and asserted that it was the correct behaviour. Converting the branch to
+`Add-Finding` fixed the script and left B asserting the old, broken output.
+
+### What scenario B now requires
+
+| Requires | Prohibits |
+| --- | --- |
+| exit `0`, one review | `Execution role audit: PASS` |
+| review contains `**Overall: REVIEW**` | `Audit did not complete` |
+| review contains `FAIL: 0. REVIEW: 1.` | `DIAGNOSTIC:` |
+| review's `Attached managed policies` stage row reads `REVIEW` | |
+| review and terminal both contain `No managed policy is attached` | |
+| terminal contains `Execution role audit: REVIEW` and `Audit complete. Nothing was changed.` | |
+
+Every other scenario and expectation is preserved exactly — A `PASS` exit `0`, C
+`REVIEW` exit `0`, D and E incomplete with exit `1` and no review, F `FAIL` exit
+`2`, G one unrecognised-inline-policy `REVIEW`, H zero-inline-policy `REVIEW`, I
+two `REVIEW` findings accumulated in both artefacts. `ExpectedCalls` is unchanged
+for all nine.
+
+### Two guards, mutation-tested three ways
+
+One asserts that **no scenario feeding an empty policy list can expect an overall
+`PASS`** — matched on the fixture rather than the scenario name, so it covers H
+as well as B, and it requires the `REVIEW` verdict in the terminal and the
+counted finding in the review. The other asserts that the two zero-policy
+branches in the audit script **record** a finding rather than printing one, which
+is the reason B must expect `REVIEW` at all; it ties the harness expectation to
+the script behaviour so the two cannot drift apart silently again.
+
+| Mutation | Result |
+| --- | --- |
+| Scenario B reverted to the original stale expectation | fails `test_no_zero_policy_scenario_expects_an_overall_pass`, nothing else |
+| Script's zero-attached branch regressed to a bare print | fails `test_an_empty_policy_list_records_a_finding_rather_than_printing_one`, nothing else |
+| B's review-file count dropped, terminal assertions left intact | fails `test_no_zero_policy_scenario_expects_an_overall_pass`, nothing else |
+
 ## What was deliberately left alone
 
 | Preserved | Status |
@@ -1858,8 +1949,8 @@ intended test and no other.
 
 | Check | Result |
 | --- | --- |
-| `.venv/bin/python -m pytest -q` | **655 passed**, 2 warnings |
-| Phase 1G module | **254 passed** (was 238) |
+| `.venv/bin/python -m pytest -q` | **658 passed**, 2 warnings |
+| Phase 1G module | **257 passed** (was 238) |
 | `ruff check backend/` | **All checks passed** |
 | `ruff format --check backend/` | **18 files already formatted** |
 | `git diff --check` | **Clean** — no whitespace errors |
@@ -1878,8 +1969,9 @@ with a guard test that fails if the parser finds nothing.
 | File | Change |
 | --- | --- |
 | `scripts/audit-lambda-execution-role.ps1` | One finding collection; `Write-Finding` split into four writers; `Get-OverallSeverity` and `Get-StageSeverity` added; renderer reads the collection; stages table generated; expected inline-policy name corrected |
-| `scripts/test-audit-lambda-execution-role-runtime.ps1` | Scenarios G, H and I added; base fixture uses the deployed policy name; scenario A asserts no spurious REVIEW |
-| `backend/tests/test_phase1g_execution_role_audit.py` | 16 net tests added; scenario rules re-driven off parsed blocks |
+| `scripts/test-audit-lambda-execution-role-runtime.ps1` | Scenarios G, H and I added; scenario B's stale `PASS` expectation corrected to `REVIEW`; base fixture uses the deployed policy name; scenario A asserts no spurious REVIEW |
+| `backend/tests/test_phase1g_execution_role_audit.py` | 19 net tests added; scenario rules re-driven off parsed blocks |
+| `scripts/audit-lambda-execution-role.ps1` (second harness run) | **Not changed.** Its scenario B behaviour was correct |
 | `CLAUDE.md` | Inline-policy name corrected; old name marked superseded |
 | `infrastructure/README.md` | Same |
 | `docs/audits/phase1d-secrets-manager-2026-07-27.md` | Superseded marker only; original wording preserved |
@@ -1917,9 +2009,9 @@ operations) and **changed nothing**. No secret value was retrieved by either.
 
 | Item | Status |
 | --- | --- |
-| **G1 — `GracefulGutAI-LambdaExecutionRole` unaudited** | **Substantially answered, formally open.** The live audit completed and assessed the role, but it ran against the *uncorrected* script, so its written review carries the wrong overall verdict. A rerun is what closes this |
-| Corrected harness rerun by AJ | **Not done.** No PowerShell on this host |
-| Corrected live audit rerun by AJ | **Not done.** Prohibited by this task |
+| **G1 — `GracefulGutAI-LambdaExecutionRole` unaudited** | **Substantially answered, formally open.** The live audit completed and assessed the role, but it ran against the *uncorrected* script, so its written review carries the wrong overall verdict. G1 stays open until the corrected harness passes **and** the corrected live audit is rerun |
+| Corrected harness rerun by AJ | **Done, and now green in principle.** The 2026-07-30 run passed A and C–I plus isolation; its one failure was the harness's stale scenario B expectation, corrected here. The corrected harness has **not** itself been rerun |
+| Corrected live audit rerun by AJ | **Not done.** Prohibited by this task, and the blocking item for G1 |
 | Whether the deployed role has findings beyond the policy name | **Unknown from the corrected script.** The completed run reported none, but through the logic being replaced here |
 | `GracefulGutAI-LambdaExecutionRole` attached policies | **Readable with administrator credentials** — demonstrated by the completed run. Still unreadable from this host, by design |
 
@@ -1965,9 +2057,11 @@ git pull --ff-only
 .\scripts\test-audit-lambda-execution-role-runtime.ps1
 ```
 
-Exit `0` and "All scenarios passed" is the expected result. Scenarios G, H and I
-are the new ones to watch: each must report `REVIEW` in **both** the terminal and
-the review file, and I must report two findings in both.
+Exit `0` and "All scenarios passed" is the expected result, with **no** failed
+assertions this time — the 2026-07-30 run's single failure was scenario B's own
+stale expectation and is corrected. Scenarios B, G, H and I are the ones to
+watch: each must report `REVIEW` in **both** the terminal and the review file,
+and I must report two findings in both.
 
 Then rerun the live audit with administrator credentials:
 
