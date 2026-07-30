@@ -1,13 +1,19 @@
 # Phase 1G — Lambda execution-role audit tooling
 
-**Date:** 2026-07-29, updated 2026-07-29 after the first administrator run
-**Outcome:** `SUCCESS` — tooling built, tested, committed, and **corrected** after
-its first run failed.
+**Date:** 2026-07-29, updated 2026-07-29 after the first administrator run,
+updated again 2026-07-30 after the second
+**Outcome:** `SUCCESS` — tooling built, tested, committed, and **corrected
+twice** after two failed administrator runs.
 **First administrator audit attempt:** **INCOMPLETE.** It failed partway through
 with a PowerShell collection-handling defect, wrote no review, and changed
-nothing. See "Update — first administrator run was INCOMPLETE" at the end.
+nothing. See "Update — first administrator run was INCOMPLETE" below.
+**Second administrator audit attempt:** **INCOMPLETE.** Caller identity passed;
+the function stage then failed with `The function configuration query returned
+fewer fields than expected.` Exit code `1`, no review written, no AWS resource
+changed, no secret value read. See "Update 2 — second administrator run was
+INCOMPLETE" at the end.
 **The audit itself:** **NOT PERFORMED.** Finding **G1** remains **open**. The
-corrected script has **not yet been rerun by AJ**.
+twice-corrected script has **not yet been rerun by AJ**.
 **Branch:** `phase1g-lambda-execution-role-audit`
 
 This report is redacted by construction. No account ID, instance ID, full ARN,
@@ -701,3 +707,502 @@ protocol. Both commits pushed to `origin/phase1g-lambda-execution-role-audit`.
 
 **Nothing was merged to `main`.** Nothing was deployed. No AWS API call was made,
 no IAM was modified, and no secret value was retrieved.
+
+---
+---
+
+# Update 2 — second administrator run was INCOMPLETE, script corrected again
+
+**Date:** 2026-07-30
+**Outcome of the second administrator audit attempt:** `INCOMPLETE`.
+**Outcome of this session's work:** `SUCCESS` — root cause found, corrected, and
+pinned by both static tests and a new runtime harness.
+**The audit:** still **NOT PERFORMED**. Finding **G1** remains **open**, and the
+corrected script has **not yet been rerun by AJ**.
+
+## What the second run actually did
+
+Run on Windows by the administrator, against the script as corrected by commit
+`7cbab34`. Recorded exactly as reported:
+
+| Stage | Result |
+| --- | --- |
+| Caller identity | **Passed** — resolved successfully |
+| **Function configuration** | **Failed before its checks completed** — `The function configuration query returned fewer fields than expected.` |
+| Expected-secret metadata | Not reached |
+| Trust policy | Not reached |
+| Attached managed policies | Not reached |
+| Inline policies | Not reached |
+| Effective permissions | Not reached |
+
+| Consequence | Result |
+| --- | --- |
+| Exit code | **1** |
+| Review file | **None written** |
+| AWS resources created, read, modified, or deleted | **None modified**; two reads reached AWS (`sts:GetCallerIdentity`, `lambda:GetFunctionConfiguration`) |
+| Secret value read | **No** |
+| Finding **G1** | **Still open** |
+
+Note the difference from the first run, because it is the useful signal. The first
+run reached the *fifth* stage. This one failed at the *second*, one stage earlier
+than the first attempt's furthest point — so the previous correction did not merely
+fail to fix everything, it moved the failure earlier. That is what identified the
+correction itself as the trigger.
+
+### The fail-closed design held again
+
+| Property | Held? |
+| --- | --- |
+| Exit non-zero when the audit cannot complete | **Yes** — `1` |
+| Write no review after an incomplete audit | **Yes** — the `$script:StagesCompleted` gate was never reached |
+| Never print `PASS` for an unfinished stage | **Yes** — only the caller stage reported, and it reported truthfully |
+| Never apply a correction | **Yes** — the script has no mutating call to make |
+
+Two failures in a row is a poor showing for the tooling. It is not a safety
+incident: both times the script stopped, said so, wrote nothing, and changed
+nothing. The cost has been administrator time, which is the thing this update is
+meant to stop spending.
+
+## Root cause
+
+**A fixed-shape record was being handled as a variable-length collection.**
+
+The failing code asked the CLI for a JMESPath multiselect *list* and then
+validated the answer by counting it:
+
+```
+--query '[State,LastUpdateStatus,Role]'
+...
+$values = @(Get-AsArray -Value $fields)
+if ($values.Count -lt 3) { Stop-Run ... }
+```
+
+`get-function-configuration` returns a record whose shape is known before the
+call is made. Its length is not data. Counting it was measuring the wrong
+property, and positional indexing meant every field's identity depended on
+nothing being reordered or nested on the way in.
+
+### Why the previous correction triggered it
+
+`Write-Output -NoEnumerate` does hand a collection to the caller as a single
+object, which is what the first fix needed. But **on Windows PowerShell 5.1 it
+wraps that object in a `[psobject]`, and on PowerShell 7 it does not.** `@(...)`
+at a call site cannot see through the wrapper: it collects the wrapper as one
+item, producing a one-element array whose single element is the real array.
+
+So `$values.Count` read **1** where the guard wanted 3 — three fields were
+returned, and the length check could not see them. That is exactly the shape the
+task description predicted: the three-field result wrapped as one nested item
+while the stage expected three top-level fields.
+
+Two things follow, and both are addressed:
+
+1. The **fixed-record** reads should never have been length-checked at all. That
+   is the primary correction.
+2. The **collection** call sites were affected by the same wrapper. The error
+   message named the function configuration, but with one attached managed policy
+   the uncast pattern yields a count of 1 — the right number by accident — whose
+   single element is the whole list rather than a policy. That is a wrong answer
+   rather than a crash, which is worse, and it is fixed too.
+
+### What was not done
+
+Per the task's explicit prohibitions, and because each of these would have hidden
+the defect rather than removed it:
+
+| Rejected approach | Why |
+| --- | --- |
+| Disable or relax `StrictMode` | StrictMode surfaced both failures. Without it the first would have silently skipped policies. |
+| Split text output on spaces | Reintroduces positional parsing with a worse delimiter. |
+| Assume tab-separated output is stable | It is not a contract, and it carries no field names. |
+| Unwrap every collection globally | Destroys the zero/one/many property the first correction bought. |
+| Revert the attached-policy collection fix | The first defect was real. Reverting trades one failure for the other. |
+| Use field counts to validate a fixed record | This is the defect, restated. |
+
+## The fix
+
+### 1. Fixed records are requested by name and read by name
+
+Every non-collection read now asks for a JMESPath multiselect **hash** and is
+parsed by `ConvertFrom-AwsJsonRecord` into one object with named properties:
+
+| Read | Query |
+| --- | --- |
+| `sts:get-caller-identity` | `{Account:Account}` |
+| `lambda:get-function-configuration` | `{State:State,LastUpdateStatus:LastUpdateStatus,Role:Role}` |
+| `secretsmanager:describe-secret` | `{Arn:ARN,KmsKeyId:KmsKeyId}` |
+| `iam:get-role` | `{AssumeRolePolicyDocument:Role.AssumeRolePolicyDocument}` |
+| `iam:get-policy` | `{DefaultVersionId:Policy.DefaultVersionId}` |
+| `iam:get-policy-version` | `{Document:PolicyVersion.Document}` |
+| `iam:get-role-policy` | `{PolicyDocument:PolicyDocument}` |
+
+A JSON object has no elements. There is nothing for `-NoEnumerate` to wrap,
+nothing for the pipeline to enumerate, and no position for a field to move to, on
+either host. `ConvertFrom-AwsJsonRecord` uses `-InputObject` rather than the
+pipeline for the same reason, and stops the run if a list, a scalar, or nothing
+arrives where a record was expected.
+
+Two reads that used `--output text` — the caller identity and the default policy
+version — are JSON now. Text output is a bare value with no field name in it, so
+it cannot be validated by name.
+
+### 2. Each required field is validated on its own
+
+`Get-RequiredField` requires a field to be present, non-null, a string, and
+non-empty, and names the field in its failure message. `State`,
+`LastUpdateStatus`, and `Role` each get their own call, so a missing one says
+which one.
+
+That is the difference from what the administrator saw. "Returned fewer fields
+than expected" said the same sentence whether `State`, `LastUpdateStatus`, or
+`Role` was absent — and it also said it when all three were present and merely
+arrived nested. A message that cannot distinguish a missing field from a misread
+response is not a diagnostic.
+
+`describe-secret`'s `KmsKeyId` is read with `Get-OptionalField` instead: it is
+null whenever the secret uses the AWS-managed key, which is a real answer and the
+shape the deployment actually has.
+
+### 3. The role ARN is reduced to a name and never emitted
+
+`Get-RoleNameFromArn` validates the ARN and extracts the role name with a named
+capture group, so a pathed role (`role/path/to/Name`) yields the name rather than
+a path element. The ARN carries the account ID, so no failure message from this
+helper contains the value — only the name of the field that was wrong. The
+configuration stage uses `$roleArn` for exactly two things: validating it and
+deriving the name from it.
+
+### 4. Collections stay collections, and their call sites became host-independent
+
+The two genuine collections are unchanged in kind:
+
+| Read | Query | Handling |
+| --- | --- | --- |
+| `iam:list-attached-role-policies` | `AttachedPolicies[].{PolicyName:PolicyName,PolicyArn:PolicyArn}` | list normalised by `Get-AsArray`; each **row** is a named record |
+| `iam:list-role-policies` | `PolicyNames` | list normalised by `Get-AsArray` |
+
+The attached-policy query shows both sides of the split in one call: the list's
+length is data, and each row's shape is not. A malformed row now fails closed
+instead of being skipped — the previous version's `continue` meant a policy could
+be silently absent from the audit, which for an audit is the worst available
+outcome.
+
+Everything the first correction established is preserved: `Write-Output
+-NoEnumerate`, the `$null` test before the wrap, zero/one/many support,
+normalisation at the call site, and `StrictMode -Version Latest`.
+
+Call sites additionally cast to `[object[]]` before the `@()` wrap. A PowerShell
+conversion unwraps a `[psobject]` and leaves a plain array untouched, so
+`@([object[]](Get-AsArray -Value $x))` is correct whether the host adds the
+wrapper or not. **This host has no PowerShell interpreter and cannot settle which
+behaviour applies by experiment, which is the reason not to depend on the
+answer.** The cast is what removes the dependency rather than betting on it.
+
+### 5. A third gate on `Invoke-AwsRead`: what a call may ask for
+
+The narrow function-configuration query was previously a convention at one call
+site. It is now enforced for every call:
+
+- `lambda:get-function-configuration` and `secretsmanager:describe-secret` may
+  not be invoked without a `--query`.
+- No query may name `Environment`, `SecretString`, or `SecretBinary`.
+
+`Environment.Variables` carries `GG_API_SECRET_ID`. Narrowing server-side keeps it
+out of the process, which is stronger than fetching it and remembering to mask it
+afterwards. The gate walks the argument list rather than indexing it, so it does
+not reintroduce the mistake it guards against.
+
+## The runtime harness — `scripts/test-audit-lambda-execution-role-runtime.ps1`
+
+Both failures were behavioural, and neither was reachable from the host the Python
+suite runs on. A static test can prove a pattern is present; it cannot prove
+PowerShell then behaves as expected. Both defects therefore travelled all the way
+to a live IAM audit before anyone saw them, which is the most expensive place to
+find them and the slowest to iterate on.
+
+The new harness runs the real audit end to end, on the administrator's own
+PowerShell, against a fake AWS CLI and deterministic fixtures.
+
+### Scenarios
+
+| # | Scenario | Expected exit | Review written? | What it proves |
+| --- | --- | --- | --- | --- |
+| A | Clean expected role: one attached managed policy, one expected inline secret policy, AWS-managed Secrets Manager encryption, expected trust policy | `0` | **Yes** | The whole audit reaches the end and files a `PASS` review |
+| B | Zero attached managed policies | `0` | Yes | The empty-collection path |
+| C | Several attached managed policies | `0` | Yes | The many-collection path, and a per-policy `REVIEW` finding |
+| D | Function configuration with `State` absent | `1` | **No** | A missing field fails, naming `State` |
+| E | Function configuration with `Role` set to `null` | `1` | **No** | Present-but-null fails, naming `Role` |
+| F | Secret grant on every secret | `2` | **Yes** | A completed audit with a real finding still files a review |
+
+B and C exist because "one" is not the interesting case by itself — the first
+failure was a one-item collection, and a fix that handled one while breaking zero
+would look correct. D and E use different absent shapes on purpose: one omits the
+key, the other sets it to `null`, which is what a JMESPath query for a field the
+response does not carry actually returns. Both occur in practice and both must
+fail, each naming its own field.
+
+D and E also assert that `returned fewer fields than expected` does **not** appear
+in the output. That is how a rerun proves which version of the script it ran.
+
+### Isolation, by construction
+
+| Control | Mechanism |
+| --- | --- |
+| No real AWS call | A fake `aws.cmd` is written into a sandbox and that directory is **prepended** to `PATH`, so a bare `aws` resolves to it |
+| Proof every call was intercepted | The fake CLI logs each call; each scenario asserts the exact expected count, so a call that escaped would leave the log short |
+| No secret value read | The fake CLI refuses `get-secret-value` and `batch-get-secret-value`, records the attempt, and the harness fails the run if that log ever appears |
+| No credentials available | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, and both profile variables are cleared for the child; `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` point at paths that do not exist; instance metadata is disabled |
+| Nothing written in the repository | The sandbox is created under the system temp directory and checked against the repository root **before** anything is written; a final sweep confirms no generated review landed in the checkout |
+| No leftovers | The sandbox is removed in a `finally` block, whether the run passes, fails, or throws — one removal, in the one place that always runs |
+| Environment restored | Every variable the harness changes is recorded first and restored in the same `finally`, including "was not set" |
+| Same host as the administrator | The audit runs as a child of the *current* PowerShell executable. Testing under PowerShell 7 while the administrator runs 5.1 would have passed both failures |
+
+The audit is run as a child process rather than dot-sourced because it ends in
+`exit`, which would terminate the harness on the first scenario — and the exit
+code is what every scenario asserts.
+
+Fixture data carries no real identifier: the account ID is the documented
+placeholder the repository's identifier scan already allows — the scan rejects any
+other twelve-digit number, so a real one cannot be substituted without failing the
+Python suite. The secret is named `fixture-secret`, and no live
+URL, ARN, secret name, or credential appears in the file. The harness also
+verifies the review file that actually landed contains no ARN, account ID, secret
+name, or URL — the audit scans the review before writing it, and this checks the
+result, which is a different and stronger statement.
+
+### The harness has not been executed
+
+It cannot be, here. There is no PowerShell interpreter on this host — `pwsh` and
+`powershell` are both absent — so the harness is **unrun**. What was verified
+locally is that its brackets, braces, and here-string terminators balance, and
+that its isolation properties hold structurally, via the tests below.
+
+That is an honest limit and worth stating plainly: this update makes the *next*
+administrator run diagnosable and cheap to iterate on, and gives AJ a way to
+check the script before spending a live run on it. It does not prove the audit
+now completes. Only running it does that, and running the harness is the cheap way
+to find out.
+
+## Tests added
+
+`backend/tests/test_phase1g_execution_role_audit.py` grew from 127 to **214**
+tests. Two new sections.
+
+### The second failure, modelled
+
+The PowerShell semantics model from the first correction gained a `[psobject]`
+wrapper and a host parameter, so every collection normalisation is now checked
+against **both** Windows PowerShell 5.1 and PowerShell 7. The model reproduces the
+second failure before proving the fix:
+
+- The positional read on the wrapping host yields a count of **1**, with the three
+  real fields one level down — the reported abort.
+- The identical code on the non-wrapping host yields **3** and passes, which is why
+  the defect was invisible to anything not run on the administrator's machine.
+- The one-attached-policy collection case yields the right count for the wrong
+  reason, with the whole list as its single element.
+- The `[object[]]` cast produces the correct array on both hosts, for zero, one,
+  and many.
+
+### The fixed-record path
+
+A model of `ConvertFrom-AwsJsonRecord` and `Get-RequiredField` proves each
+rejection: absent field, `null` field, empty and whitespace-only field, non-string
+field, a positional list arriving where a record was expected, and a bare scalar.
+Each configuration field is tested absent and `null` independently, and each must
+name itself. One test shows what the old length check could not have caught — a
+response carrying `State` and `Role` but a `null` `LastUpdateStatus` passes a
+length check while leaving a value empty.
+
+Structural guards then pin the script itself:
+
+- Every one of the seven fixed-shape reads asks for its documented multiselect
+  hash, and every one is read as JSON.
+- The two collection reads are still queried as collections.
+- The fixed-record and collection tables together must cover **every** entry on
+  the allow-list, so a read cannot be added without being classified.
+- No positional `'--query', '[...]'` survives anywhere.
+- No `--output text` survives anywhere.
+- `Get-FunctionRoleName` contains no `.Count`, no numeric index, and no
+  `Get-AsArray` call at all.
+- The old failure message is gone from the executable script — and still present
+  in a comment, deliberately, so the next reader knows what it replaced.
+- The role-ARN regex is read **out of the script** and tested against a plain role
+  ARN, a pathed role ARN, a user ARN, a Lambda ARN, a short account ID, and an
+  empty string.
+- No `Stop-Run` in the role-name helper carries `$Arn`.
+
+### The harness is isolated
+
+Thirty-odd tests over the harness, including: the fake CLI is prepended to `PATH`
+rather than appended; the harness invokes nothing but a PowerShell host; every
+environment variable it changes is on the restore list; the fake CLI refuses both
+secret reads and fails closed on an unknown call; the fake CLI never parses the
+`--query` and never forwards `%*` (cmd.exe splits arguments on commas, so a shim
+that read the JMESPath expression would depend on tokenisation the harness cannot
+control); the sandbox guard precedes the first write; no write target is built
+from `$PSScriptRoot` or the repository root; the sandbox removal is in the
+`finally` and appears exactly once; all six required scenarios are declared; and
+the fixture set matches the allow-list exactly.
+
+### Preserved from the first correction
+
+Every test from the first correction still runs and still passes: the
+`-NoEnumerate` guard, the null-before-wrap ordering, the zero/one/many
+parametrisations for attached policies, inline policies, statements, `Action`,
+`Resource`, and `Principal.Service`, the requirement-9 `.Count`-receiver scan, and
+the index-guard scan.
+
+Two of those tests were adjusted rather than removed, and the reasons are
+recorded in the tests themselves:
+
+- The `.Count`-receiver floor dropped from 15 to 12, because four `.Count` usages
+  were **deleted** — the function-configuration and secret-metadata reads no
+  longer count anything. Fewer is the improvement. The test now also asserts the
+  four remaining collection receivers by name, so it cannot pass by having nothing
+  left to check.
+- `test_every_normaliser_call_site_is_wrapped` became
+  `test_every_normaliser_call_site_is_wrapped_and_cast`, requiring the
+  `[object[]]` cast as well as the `@()`.
+
+## Verification results — this update
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Full suite | `.venv/bin/python -m pytest -q` | **615 passed**, 2 warnings (pre-existing dependency deprecations) |
+| Phase 1G suite | `.venv/bin/python -m pytest backend/tests/test_phase1g_execution_role_audit.py -q` | **214 passed** (was 127) |
+| Lint | `.venv/bin/ruff check backend/` | **All checks passed** |
+| Formatting | `.venv/bin/ruff format --check backend/` | **18 files already formatted** |
+| Whitespace | `git diff --check` | **Clean** |
+| PowerShell syntax | bracket, brace, and here-string balance, both scripts | **Balanced** |
+| PowerShell execution | — | **Not possible.** No interpreter on this host; `pwsh` and `powershell` both absent |
+
+## Files — this update
+
+### Added
+
+| File | Lines | Purpose |
+| --- | --- | --- |
+| `scripts/test-audit-lambda-execution-role-runtime.ps1` | 826 | Runtime fixture harness: six scenarios, fake AWS CLI, no AWS call |
+
+### Modified
+
+| File | Change |
+| --- | --- |
+| `scripts/audit-lambda-execution-role.ps1` | Fixed records requested and read by name; `ConvertFrom-AwsJson` split into `ConvertFrom-AwsJsonList` and `ConvertFrom-AwsJsonRecord`; `Get-RequiredField`, `Get-OptionalField`, and `Get-RoleNameFromArn` added; `[object[]]` cast at every normaliser call site; third `Invoke-AwsRead` gate on query content |
+| `backend/tests/test_phase1g_execution_role_audit.py` | 127 → 214 tests; `[psobject]` wrapper and both hosts modelled; fixed-record section; harness-isolation section |
+| `docs/audits/phase1g-lambda-execution-role-audit-2026-07-29.md` | This update |
+
+### Deleted
+
+None.
+
+## Commits — this update
+
+| Commit | What |
+| --- | --- |
+| `1515684` | Starting point on `main` (branch merge-base) |
+| `9bc7356` | Build Phase 1G execution-role audit tooling (original) |
+| `3ed894b` | Document Phase 1G execution-role audit tooling (original) |
+| `7cbab34` | Fix Phase 1G PowerShell collection handling (first correction) |
+| `9827dda` | Document incomplete Phase 1G audit attempt (first correction) |
+| `0fe787d` | **Fix Phase 1G fixed-record parsing** (implementation + tests, this update) |
+| _report commit_ | **Document incomplete Phase 1G audit** (this report update) |
+
+## AWS resources created, read, modified, or deleted — this update
+
+**None.** No AWS API call was made from this host during this task. Local work
+only:
+
+| Category | This session |
+| --- | --- |
+| Created | **None** |
+| Read | **None** — no `aws` command was run |
+| Modified | **None** |
+| Deleted | **None** |
+| Deployed | **None** |
+| Secrets Manager accessed | **None** |
+| Secret value retrieved | **None** |
+| Lambda function or Function URL touched | **None** |
+
+The two reads that did reach AWS were made by the administrator's own second run,
+before this session, and are recorded in the table at the top of this update.
+
+## Security and privacy checks — this update
+
+| Check | Result |
+| --- | --- |
+| Allow-list unchanged | **Yes** — the same nine reads, verified against every call site by test |
+| Forbidden secret reads still refused first | **Yes** — ahead of the allow-list check, so the refusal stays specific |
+| New gate adds no capability | **Yes** — it only narrows what an allow-listed read may ask for |
+| Secret value can enter the process | **No** — forbidden by name, absent from the allow-list, and its payload fields are refused in any query |
+| Environment variables fetched | **Never** — enforced by the wrapper now, not only by convention at one call site |
+| Full ARN or account ID in terminal output | **No** — masked; the role helper's failure messages carry the field name only |
+| Full ARN or account ID in the review | **No** — scanned before writing, and the harness re-checks the file that landed |
+| Real identifier in any tracked file | **No** — the harness is in the repository-wide identifier scan's strict list |
+| Real secret identifier in a Phase 1G file | **No** — fixtures use `fixture-secret` |
+| Fail-closed behaviour | **Preserved** — exit `1` when incomplete, no review after an incomplete audit, `PASS` produced in one place, no correction ever applied |
+| `StrictMode -Version Latest` | **Preserved** |
+| Product boundaries | **Untouched** — no endpoint, prompt, or copy changed |
+| PHI or user health text | **None** — this task touches neither |
+
+## Blockers and unresolved findings — this update
+
+| Item | Status |
+| --- | --- |
+| **G1 — `GracefulGutAI-LambdaExecutionRole` unaudited** | **Open.** Carried since Phase 1D. The audit has now been attempted twice and completed zero times. |
+| Twice-corrected script rerun by AJ | **Not done.** This is the blocking next action. |
+| Runtime harness executed | **Not done.** No PowerShell interpreter on this host. Unrun, and stated as such above. |
+| `GracefulGutAI-LambdaExecutionRole` attached policies | **Still unreadable from this host.** Unchanged and by design. |
+
+### Honest assessment of the remaining risk
+
+Two administrator runs have now failed on PowerShell semantics rather than on
+anything about IAM. A third failure is possible, and the reason it is less likely
+is not that the code has been read more carefully — it is that the harness makes
+the failure mode reachable without administrator credentials. If a third defect of
+this class exists, running the harness finds it in seconds on AJ's own machine.
+
+There is one class this update cannot rule out: a PowerShell construct that
+behaves differently on 5.1 and 7 in some path the harness does not exercise. The
+mitigation is that the harness runs the *whole* audit rather than a unit of it, on
+whichever host the administrator uses.
+
+## Decisions required from AJ or Jenna — this update
+
+**None.** No product, security, or architectural decision is required. This was a
+defect correction plus test tooling, all local.
+
+## Recommended next step
+
+Run the harness first, then the audit. The harness needs no credentials, touches
+no AWS, and takes seconds:
+
+```powershell
+git fetch origin
+git checkout phase1g-lambda-execution-role-audit
+git pull --ff-only
+
+.\scripts\test-audit-lambda-execution-role-runtime.ps1
+```
+
+Exit code `0` and "All scenarios passed" means the audit's plumbing works on that
+machine. If any scenario fails, send the output — it names the scenario, the
+expectation, and the captured terminal text, which is everything needed to fix it
+without another live run.
+
+Then, with administrator credentials:
+
+```powershell
+.\scripts\audit-lambda-execution-role.ps1 -ExpectedSecretName <secret-name> -NoOpen
+```
+
+Exit `0` is a clean role, `2` is a completed audit with findings — both write a
+review under `TEMP`. Exit `1` means it stopped again; send the terminal output.
+
+Do not paste the secret identifier into this report or any other tracked file.
+
+## Push — this update
+
+Branch `phase1g-lambda-execution-role-audit` pushed to `origin`. **Not merged to
+`main`**, per the task.
