@@ -1,9 +1,11 @@
 # Phase 1G — Lambda execution-role audit tooling
 
 **Date:** 2026-07-29, updated 2026-07-29 after the first administrator run,
-updated again 2026-07-30 after the second
-**Outcome:** `SUCCESS` — tooling built, tested, committed, and **corrected
-twice** after two failed administrator runs.
+updated 2026-07-30 after the second, updated again 2026-07-30 after the runtime
+harness run
+**Outcome:** `SUCCESS` — tooling built, tested, committed, and **corrected three
+times**: twice after failed administrator runs, once after a failed runtime
+harness run.
 **First administrator audit attempt:** **INCOMPLETE.** It failed partway through
 with a PowerShell collection-handling defect, wrote no review, and changed
 nothing. See "Update — first administrator run was INCOMPLETE" below.
@@ -11,9 +13,18 @@ nothing. See "Update — first administrator run was INCOMPLETE" below.
 the function stage then failed with `The function configuration query returned
 fewer fields than expected.` Exit code `1`, no review written, no AWS resource
 changed, no secret value read. See "Update 2 — second administrator run was
-INCOMPLETE" at the end.
+INCOMPLETE".
+**Runtime harness run by AJ (Windows PowerShell 5.1):** **FAILED.** All six
+scenarios reached their expected parsing and audit stages; D and E passed fully;
+A, B, C and F reached **correct verdicts** and then failed during review
+generation with `Argument types do not match`, writing no review and returning
+exit `1`. Every AWS call went to the fake CLI, no real AWS call occurred, no
+secret-value operation was attempted, and no review was written inside the
+repository. See "Update 3 — runtime harness FAILED in review generation" at the
+end.
 **The audit itself:** **NOT PERFORMED.** Finding **G1** remains **open**. The
-twice-corrected script has **not yet been rerun by AJ**.
+live AWS audit was **not rerun**, and the corrected harness has **not yet been
+rerun by AJ**.
 **Branch:** `phase1g-lambda-execution-role-audit`
 
 This report is redacted by construction. No account ID, instance ID, full ARN,
@@ -1199,6 +1210,378 @@ Then, with administrator credentials:
 
 Exit `0` is a clean role, `2` is a completed audit with findings — both write a
 review under `TEMP`. Exit `1` means it stopped again; send the terminal output.
+
+Do not paste the secret identifier into this report or any other tracked file.
+
+## Push — this update
+
+Branch `phase1g-lambda-execution-role-audit` pushed to `origin`. **Not merged to
+`main`**, per the task.
+
+---
+
+# Update 3 — runtime harness FAILED in review generation, renderer corrected
+
+**Date:** 2026-07-30
+**Outcome of AJ's runtime harness run:** `FAILED`.
+**Outcome of this session's work:** `SUCCESS` — the failing path was rewritten to
+a host-independent shape, pinned by regression tests, and mutation-tested.
+**The audit:** still **NOT PERFORMED**. Finding **G1** remains **open**. The live
+AWS audit was **not rerun**, and the corrected harness has **not yet been rerun
+by AJ**.
+**Branch:** `phase1g-lambda-execution-role-audit`
+**Starting commit:** `827043e`
+**Implementation commit:** `9eb1e05`
+
+No AWS call was made during this Claude task. No IAM was modified, no Lambda
+function or Function URL was touched, no Secrets Manager operation was attempted,
+and nothing was deployed. All work was in the repository.
+
+## What AJ's harness run actually did
+
+The new Windows PowerShell 5.1 runtime harness was executed by AJ. **Process
+result: FAILED.** Recorded exactly as reported.
+
+The harness proved the previous two corrections work. These are now settled facts
+about Windows PowerShell 5.1, not hopes:
+
+| Proven by the run | Result |
+| --- | --- |
+| Function configuration parses correctly | **Yes** |
+| Missing `State` fails, and names `State` | **Yes** |
+| Missing `Role` fails, and names `Role` | **Yes** |
+| Zero, one, and multiple attached-policy scenarios reach the verdict | **Yes** |
+| Policy documents resolve correctly | **Yes** |
+| Permission classification completes | **Yes** |
+| `PASS`, `REVIEW`, and `FAIL` verdicts are calculated correctly | **Yes** |
+| Every AWS call was intercepted by the fake CLI | **Yes** |
+| No secret-value read was attempted | **Yes** |
+| No review was written inside the repository | **Yes** |
+
+The remaining failure is isolated to **review generation**.
+
+| Scenario | Reached | Result |
+| --- | --- | --- |
+| A. clean expected role | Verdict, then `Review` | **Failed in review generation** |
+| B. zero attached managed policies | Verdict, then `Review` | **Failed in review generation** |
+| C. multiple attached managed policies | Verdict, then `Review` | **Failed in review generation** |
+| D. configuration missing `State` | Function stage | **Passed** — every assertion |
+| E. configuration with a null `Role` | Function stage | **Passed** — every assertion |
+| F. secret grant on every secret | Verdict, then `Review` | **Failed in review generation** |
+
+In every completed scenario — A, B, C and F — terminal output reached the
+`Review` section header and then reported:
+
+```
+Argument types do not match
+```
+
+The script then correctly reported:
+
+```
+Audit did not complete. No review was written.
+Nothing was changed -- this script only ever reads.
+```
+
+D and E, which intentionally stop before review generation, passed all of their
+assertions.
+
+### The fail-closed design held a third time
+
+| Property | Held? |
+| --- | --- |
+| Exit non-zero when the audit cannot complete | **Yes** — completed scenarios returned `1` |
+| Write no review after an incomplete run | **Yes** — the write is downstream of the failure |
+| Never print `PASS` for an unfinished stage | **Yes** — every stage that reported, reported truthfully |
+| Never apply a correction | **Yes** — the script has no mutating call to make |
+| No real AWS call | **Yes** — every call reached the fake CLI |
+| No secret-value operation attempted | **Yes** |
+| No review written inside the repository | **Yes** |
+
+Worth stating plainly: the verdicts were **already correct** in all four failing
+scenarios. The audit logic reached the right answer and then could not write it
+down.
+
+## Root cause — what inspection supports, and what it does not
+
+`Argument types do not match` is the message `System.Reflection` raises when a
+method is invoked with an argument whose runtime type is not assignable to the
+chosen overload's parameter type. In PowerShell it surfaces from a .NET method
+call, not from PowerShell's own operators. On Windows PowerShell 5.1 the usual
+source in a script of this shape is a **collection**: a generic `List`, or an
+array inside the `[psobject]` wrapper that `Write-Output -NoEnumerate` produces,
+crossing a function boundary and then being formatted, joined, or handed to a
+.NET call that has more than one overload to pick from.
+
+There is no PowerShell interpreter on this host, so the cause was narrowed by
+inspection rather than by experiment.
+
+### What the harness itself exonerates
+
+This turned out to be the most useful evidence available, and it costs nothing:
+the harness runs on the *same host*, and its own startup and fixture-writing code
+already exercises several of the candidates. They ran successfully in AJ's run —
+fixtures were written and all six scenarios started — so they are not the cause.
+
+| Candidate expression | Status | Why |
+| --- | --- | --- |
+| `[System.IO.Path]::GetFullPath(...)` | **Exonerated** | The harness calls it twice at startup, before any scenario |
+| `String.StartsWith(String, StringComparison)` | **Exonerated** | Same — harness startup, sandbox-vs-repository check |
+| `List[string].Add(...)` | **Exonerated** | The harness's own failure list is a `List[string]` and recorded failures |
+| `New-Object System.Text.UTF8Encoding($false)` | **Exonerated** | The harness constructs one and used it for every fixture |
+| `[System.IO.File]::WriteAllText(path, text, encoding)` | **Exonerated** | Same — every fixture file was written with it |
+| `-join` over a plain array | **Exonerated** | Used in both scripts' native-command wrappers, which ran |
+
+### What is left, and is not exonerated
+
+Two constructs were unique to the audit's review path.
+
+| Candidate | Where | Why it is a Windows PowerShell 5.1 hazard |
+| --- | --- | --- |
+| `-join` applied to a **generic `List[string]`** | the review-line boundary | Every other join in either script is over a plain array. This one was over a generic collection |
+| Indexing an `[ordered]` dictionary reached through a **`[psobject]`-wrapped parameter property** | the category table | `OrderedDictionary` exposes two `Item` accessors, one taking `Int32` and one taking `Object`. The permission classifier indexes the *same* dictionary successfully — but it holds it in a local variable, not through a parameter |
+
+**Neither is named here as the cause.** Inspection cannot settle which one raised
+the exception, and a guess recorded in a report is read as a finding later. What
+inspection *does* support is that both are of the failing class, both are unique
+to the failing path, and both can be removed without touching any logic the
+harness proved correct.
+
+So the correction does not target a line. It removes every shape in the review
+path that can produce this class of failure, and adds the diagnostic that would
+have identified the line in the first place.
+
+## The fix
+
+Confined to review rendering. The AWS parsing, policy resolution, permission
+classification, trust-policy logic and verdict logic are **unchanged** — the
+harness proved all of them work, and no test suggested a change was needed.
+
+**`scripts/audit-lambda-execution-role.ps1`**
+
+| Change | Why |
+| --- | --- |
+| Every stage result is converted once, at the top of `New-ReviewFile`, into a plain `[object[]]` | No generic `List` and no `[psobject]` wrapper reaches formatting, joining, or file writing |
+| The `$null` case is guarded **before** the cast | `[object[]]$null` is `$null`, not an empty array — the same lesson as `Get-AsArray` |
+| The category table iterates the dictionary's **enumerator** instead of indexing it | The enumerator yields key and value together, so there is no `Item` overload to resolve |
+| Every interpolated value in a review line is cast to `[string]` or `[int]` | A subexpression must not emit whatever a property happened to hold |
+| Findings are counted with an explicit loop rather than piped through `Where-Object` | Removes a pipeline whose output shape varies with the number of matches |
+| Review lines are converted **individually** to `[string]`, stored as `[string[]]`, and joined with PowerShell's `-join` | This is the boundary the task named. `-join` is a PowerShell operator, not a .NET call, so there is no overload to resolve |
+| `[string]::Join` is **not** used, and a test forbids it | Four overloads is the problem, not the solution |
+| `WriteAllText` receives three explicitly typed arguments | Leaves the binder nothing to decide, even though this call is exonerated |
+| No `@($genericList)` survives in the review path | `@(...)` cannot see through a `[psobject]` wrapper — that is what broke the second run |
+| `Write-Output -NoEnumerate` is not used anywhere in the review path | It is what introduced the wrapper originally; it must not be the fix here |
+
+**What was deliberately not changed:**
+
+- `Set-StrictMode -Version Latest` — still on.
+- The fixed-record JSON-object correction, and the zero/one/many collection
+  handling. Both proven by this run; both untouched.
+- The `[object[]]` collection normalisation where it is already required.
+- The read-only AWS operation allow-list, the forbidden secret-value operations,
+  and the narrow query-content gate.
+- Fail-closed review scanning. **Redaction was not weakened to make the write
+  succeed** — the scan still runs on the finished text before the write, and a
+  match still produces no file rather than a file with a warning.
+- No review after an incomplete audit; `exit 0` for `PASS`, `2` for a completed
+  `FAIL`, `1` for an incomplete run.
+
+## The failure diagnostic
+
+Three administrator runs have now been spent turning a bare exception message
+into a location. The audit now prints one line when it dies:
+
+```
+DIAGNOSTIC: stage='<stage>' function='<function>' line=<n> exception=<type>
+```
+
+The stage comes from `Write-Section`, which is the single place a stage begins,
+so there is one writer and it is always a literal from the script. The line
+number is an offset into the file. The exception type is a .NET type name.
+
+What it must not carry is enforced rather than argued. A stack frame is the
+fastest way to get an absolute user path into a report — PowerShell renders each
+as `at <function>, <full script path>: line n` — so only the text before the
+first comma is taken, and it is discarded entirely if it contains a path
+separator or a colon. The whole line then goes through `Hide-Sensitive` anyway.
+It carries no account ID, ARN, secret name, URL, credential, token,
+environment-variable value, or absolute path.
+
+**`scripts/test-audit-lambda-execution-role-runtime.ps1`** — all six scenarios
+preserved. The harness now lifts the diagnostic to the top of a failure report
+instead of leaving it in the captured output, and fails the scenario if the line
+ever carries a path separator. Scenario expectations:
+
+| Scenario | Exit | Review | Diagnostic |
+| --- | --- | --- | --- |
+| A. clean expected role | `0` | `PASS` review, completion message | **Must be absent** |
+| B. zero attached managed policies | `0` | exactly one review; a `REVIEW` finding for the missing managed logging policy may be present | **Must be absent** |
+| C. multiple attached managed policies | `0` | one review, correct verdict, completed audit | **Must be absent** |
+| D. configuration missing `State` | `1` | none | **Must be present**, naming stage `Function` |
+| E. configuration with a null `Role` | `1` | none | **Must be present**, naming stage `Function` |
+| F. secret grant on every secret | `2` | one `FAIL` review, completed audit | **Must be absent** |
+
+Requiring the diagnostic to be *absent* from the four completed scenarios is the
+direct regression guard for this failure: if review generation dies again, those
+scenarios fail on the diagnostic rather than on a downstream symptom. Requiring
+it to be *present* in D and E stops that guard from passing by the diagnostic
+never being emitted at all.
+
+## Tests added
+
+Twenty-four new tests in `backend/tests/test_phase1g_execution_role_audit.py`,
+covering exactly what the task specified:
+
+| Rule | Enforced |
+| --- | --- |
+| Final review lines are an explicit `[string[]]` | Yes |
+| Each line is converted to `[string]` individually on the way in | Yes |
+| The review text is produced with the `-join` operator | Yes |
+| No generic `List` is passed directly to review joining | Yes — the join receiver must be the normalised array |
+| `[string]::Join` is not used with an unverified collection | Yes — it is not used at all |
+| No `@($genericList)` survives in the review path | Yes |
+| No format operation receives a `[psobject]`-wrapped array | Yes — no `-f` and no `::Format(` in the path |
+| Stage results are normalised with an `[object[]]` cast, `$null` guarded first | Yes |
+| The ordered dictionary is no longer indexed in the review | Yes |
+| The classifier still owns the category counts | Yes — the correction did not leak into it |
+| Every interpolated review value is explicitly typed | Yes |
+| `WriteAllText` receives explicitly typed arguments | Yes |
+| `Write-Output -NoEnumerate` is absent from the review path | Yes |
+| The review scan still occurs before the write | Yes — pre-existing test, still passing |
+| Completed `PASS` and `FAIL` audits both write reviews; incomplete audits write none | Yes — scenario assertions, pre-existing and extended |
+| The diagnostic names stage, function, line, and exception type | Yes |
+| The diagnostic drops anything path-shaped, and is masked before printing | Yes |
+| One writer for the stage, and every stage name is a literal | Yes |
+| The previous fixed-record and collection tests remain intact | Yes — all still present and passing |
+
+One existing guard was **widened rather than weakened**. The `.Count`-receiver
+scan now accepts a type-constrained declaration such as `[object[]]$rows`. That
+is a *stronger* proof that a variable is a collection than `@(...)` is, because
+PowerShell enforces the constraint on every later assignment too, not just the
+first.
+
+### Mutation-tested
+
+Six mutations were injected to confirm the new rules are not vacuous. Each was
+caught by the intended test, and the script was restored after each:
+
+| Mutation | Caught by |
+| --- | --- |
+| Join the generic `List` directly, as before the correction | 4 tests, including `test_no_generic_list_is_joined_in_the_review_path` |
+| Re-index the ordered dictionary through the wrapped property | `test_the_ordered_dictionary_is_no_longer_indexed_in_the_review` |
+| `[string]::Join` over the generic `List` | 3 tests, including `test_string_join_is_not_used_anywhere_in_the_script` |
+| `@($genericList)` back in the review path | `test_no_generic_list_is_wrapped_in_an_array_subexpression_in_the_review` |
+| Write the review before scanning it | `test_the_review_is_scanned_before_it_is_written` |
+| Drop the failure diagnostic from the catch block | `test_the_script_emits_a_diagnostic_when_a_run_dies` |
+
+## Verification results — this update
+
+| Check | Result |
+| --- | --- |
+| `pytest` | **639 passed**, 0 failed, 2 warnings |
+| Phase 1G module | **238 passed** (was 214) |
+| `ruff check backend/` | **All checks passed** |
+| `ruff format --check backend/` | **18 files already formatted** |
+| `git diff --check` | **Clean** — no whitespace errors |
+| Runtime harness executed here | **No.** No PowerShell interpreter on this host |
+| Live audit executed here | **No.** Prohibited by the task, and impossible from the dev role |
+
+## Files — this update
+
+### Modified
+
+| File | Change |
+| --- | --- |
+| `scripts/audit-lambda-execution-role.ps1` | Review renderer rewritten to a host-independent shape; `Get-SafeDiagnostic` added; stage recorded in `Write-Section`; diagnostic emitted from the catch block |
+| `scripts/test-audit-lambda-execution-role-runtime.ps1` | Diagnostic surfaced and path-checked; six scenarios extended with diagnostic expectations |
+| `backend/tests/test_phase1g_execution_role_audit.py` | 24 tests added; `.Count`-receiver scan widened to accept type-constrained declarations |
+| `docs/audits/phase1g-lambda-execution-role-audit-2026-07-29.md` | This update |
+
+No file was added or deleted.
+
+## AWS resources created, read, modified, or deleted — this update
+
+**None.** No AWS call of any kind was made during this Claude task — not a read,
+not a write, not an identity check. No IAM was modified. No Lambda function or
+Function URL was touched. No Secrets Manager operation was attempted and no
+secret value was retrieved. Nothing was deployed.
+
+AJ's harness run also made **no real AWS call**: every call was intercepted by
+the fake CLI, and no secret-value operation was attempted.
+
+## Security and privacy checks — this update
+
+| Check | Result |
+| --- | --- |
+| Secret values in the diff | **None** |
+| Secret identifiers in the diff or this report | **None** |
+| Account IDs, instance IDs, full ARNs | **None** |
+| Live Function URL or API endpoint | **None** |
+| Credentials, tokens, authorization headers | **None** |
+| Health text, PHI, or personal identifying information | **None** |
+| Redaction weakened to make the write succeed | **No** — the scan is unchanged and still runs before the write |
+| Read-only allow-list, forbidden secret operations, query gate | **Unchanged** |
+| New diagnostic could leak a path, ARN, account ID, or env value | **No** — path-shaped frames dropped, whole line masked, tested |
+
+## Blockers and unresolved findings — this update
+
+| Item | Status |
+| --- | --- |
+| **G1 — `GracefulGutAI-LambdaExecutionRole` unaudited** | **Open.** Carried since Phase 1D. The live audit has been attempted twice and completed zero times, and was **not rerun** in this task |
+| Corrected harness rerun by AJ | **Not done.** This is the blocking next action |
+| Live AWS audit rerun | **Not done**, and out of scope for this task |
+| Runtime harness executed here | **Not possible.** No PowerShell interpreter on this host |
+| `GracefulGutAI-LambdaExecutionRole` attached policies | **Still unreadable from this host.** Unchanged and by design |
+
+### Honest assessment of the remaining risk
+
+The harness did its job: it moved a failure that previously cost an administrator
+run into something reproducible on AJ's machine with no credentials and no AWS.
+That is why this failure was diagnosed from a process exit rather than from a
+live audit attempt.
+
+What this update cannot claim is that it fixed *the* line. Without a PowerShell
+interpreter here, the exact expression that raised `Argument types do not match`
+is not knowable from inspection, which is why this report names candidates rather
+than a culprit. The correction is defensible on different grounds: every
+construct in the review path that belongs to the failing class is gone, replaced
+with shapes that bind identically on 5.1 and 7.
+
+If a fourth failure of this class exists, the diagnostic now names the stage, the
+function, and the line on the first run — so the next report will not have to
+reason about candidates at all.
+
+## Decisions required from AJ or Jenna — this update
+
+**None.** No product, security, or architectural decision is required. This was a
+defect correction plus test tooling, all local to the repository.
+
+## Recommended next step
+
+Rerun the harness. It needs no credentials, touches no AWS, and takes seconds:
+
+```powershell
+git fetch origin
+git checkout phase1g-lambda-execution-role-audit
+git pull --ff-only
+
+.\scripts\test-audit-lambda-execution-role-runtime.ps1
+```
+
+Exit `0` and "All scenarios passed" means review generation now works on that
+machine. If any scenario fails, send the output — it now leads with the
+`DIAGNOSTIC:` line naming the stage, function, and script line, which is enough
+to fix it without another live run.
+
+Then, with administrator credentials:
+
+```powershell
+.\scripts\audit-lambda-execution-role.ps1 -ExpectedSecretName <secret-name> -NoOpen
+```
+
+Exit `0` is a clean role, `2` is a completed audit with findings — both write a
+review under `TEMP`. Exit `1` means it stopped again; send the terminal output
+including the `DIAGNOSTIC:` line.
 
 Do not paste the secret identifier into this report or any other tracked file.
 
