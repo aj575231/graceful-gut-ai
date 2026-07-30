@@ -1,11 +1,13 @@
 # Phase 1G — Lambda execution-role audit tooling
 
 **Date:** 2026-07-29, updated 2026-07-29 after the first administrator run,
-updated 2026-07-30 after the second, updated again 2026-07-30 after the runtime
-harness run
-**Outcome:** `SUCCESS` — tooling built, tested, committed, and **corrected three
+updated 2026-07-30 after the second, again 2026-07-30 after the runtime harness
+run, and again 2026-07-30 after the first successful harness run and live audit
+**Outcome:** `PARTIAL` — tooling built, tested, committed, and **corrected four
 times**: twice after failed administrator runs, once after a failed runtime
-harness run.
+harness run, and once after the first **successful** harness run and live audit
+exposed two defects that no crash could have surfaced. The corrected script has
+not been rerun, so Phase 1G is **not** closed.
 **First administrator audit attempt:** **INCOMPLETE.** It failed partway through
 with a PowerShell collection-handling defect, wrote no review, and changed
 nothing. See "Update — first administrator run was INCOMPLETE" below.
@@ -20,11 +22,18 @@ A, B, C and F reached **correct verdicts** and then failed during review
 generation with `Argument types do not match`, writing no review and returning
 exit `1`. Every AWS call went to the fake CLI, no real AWS call occurred, no
 secret-value operation was attempted, and no review was written inside the
-repository. See "Update 3 — runtime harness FAILED in review generation" at the
-end.
-**The audit itself:** **NOT PERFORMED.** Finding **G1** remains **open**. The
-live AWS audit was **not rerun**, and the corrected harness has **not yet been
-rerun by AJ**.
+repository. See "Update 3 — runtime harness FAILED in review generation".
+**Second runtime harness run by AJ:** **PASSED.** All scenarios reached their
+expected verdicts, review generation worked, and no diagnostic was printed.
+**First completed live execution-role audit:** **SUCCESS**, and it exposed two
+defects that no crash could have surfaced — the terminal and the written review
+disagreed about the same run, and the expected inline-policy name was one that
+had never been deployed. The role itself resolved cleanly, with the secret grant
+correctly scoped to a single secret. Both defects are corrected here; **no IAM
+was changed**. See "Update 4" at the end.
+**The audit itself:** **PERFORMED, but through the logic this update replaces.**
+Finding **G1** is **substantially answered and formally open**: the corrected
+script has **not** been rerun, by AJ or here.
 **Branch:** `phase1g-lambda-execution-role-audit`
 
 This report is redacted by construction. No account ID, instance ID, full ARN,
@@ -227,6 +236,14 @@ policy for review.
 Treating all inline policies as findings would have produced a guaranteed false
 positive on a correctly built role — the same class of error as the wildcard
 question above.
+
+> **Superseded by Update 4 (2026-07-30).** The judgement call above holds — one
+> named inline policy is expected and any other is a review — but the name it
+> picked was wrong. `GracefulGutAI-ReadApiKeySecret` was read out of an
+> administrator *instruction* and mistaken for a record of what had been run.
+> The deployed policy is `GracefulGutAI-SecretAccess`, and this expectation is
+> exactly why the first successful live audit flagged the correct role. See
+> "Update 4" below.
 
 ---
 
@@ -1582,6 +1599,350 @@ Then, with administrator credentials:
 Exit `0` is a clean role, `2` is a completed audit with findings — both write a
 review under `TEMP`. Exit `1` means it stopped again; send the terminal output
 including the `DIAGNOSTIC:` line.
+
+Do not paste the secret identifier into this report or any other tracked file.
+
+## Push — this update
+
+Branch `phase1g-lambda-execution-role-audit` pushed to `origin`. **Not merged to
+`main`**, per the task.
+
+---
+
+# Update 4 — harness PASSED, live audit COMPLETED, two reconciliation defects fixed
+
+**Date:** 2026-07-30
+**Outcome of AJ's runtime harness run:** `SUCCESS` — all scenarios passed.
+**Outcome of AJ's live execution-role audit:** `SUCCESS` — the audit completed
+and wrote a review, for the first time in this phase.
+**Outcome of this session's work:** `PARTIAL` — both defects the live run exposed
+are corrected and pinned, but the corrected script has **not** been rerun, so
+Phase 1G stays open.
+
+**Branch:** `phase1g-lambda-execution-role-audit`
+**Starting commit (this update):** `633be9f`
+**Implementation commit:** `01aa0c7` — *Reconcile Phase 1G policy naming and verdicts*
+**Report commit:** recorded in "Push — this update" below.
+
+## What the two runs actually did
+
+The harness ran to completion on AJ's Windows PowerShell 5.1 host. The renderer
+rewrite from Update 3 held: every scenario reached its expected verdict, review
+generation worked, no `DIAGNOSTIC:` line was printed, every AWS call went to the
+fake CLI, no secret-value operation was attempted, and no review landed in the
+checkout.
+
+The live audit then ran with administrator credentials and **completed** — the
+first time in this phase that it did. It resolved the trust policy, the attached
+managed policy, the inline policy, and the effective permissions, and wrote a
+review under `TEMP`. Nothing in AWS was changed.
+
+Two things were wrong with what it produced. Neither is a crash, and that is why
+neither of the three previous failures could have surfaced them.
+
+## Defect 1 — the terminal and the review disagreed about the same run
+
+The terminal reported:
+
+```
+[REVIEW] Resolved inline policy: <name>
+         not part of the documented setup
+```
+
+The review file, generated seconds later by the same process, reported
+`**Overall: PASS**` and `FAIL: 0. REVIEW: 0.`
+
+Neither artefact was internally inconsistent. That is what makes this worse than
+either being plainly wrong: read on its own, each one looked like a settled
+result, and there was no way to tell which to act on without holding both up
+together. An administrator who filed the review file — the durable artefact, the
+one written to be pasted into a report — would have recorded a clean audit of a
+role the audit had actually flagged.
+
+### Root cause
+
+Structural, not a wrong comparison. Findings lived in **three** places:
+
+| Where | Who wrote to it | Did the review read it? |
+| --- | --- | --- |
+| `$script:PermissionFindings` | the permission stage | yes |
+| a local `$findings` list | the trust stage | yes, via its return value |
+| nowhere | the policy-resolution stages | **no — nothing was recorded at all** |
+
+The inline-policy check called the old `Write-Finding`, which **printed** a
+classification and returned. It recorded nothing, so no collection the renderer
+read had ever heard of it. The renderer then computed its own counts and its own
+overall verdict from the two collections it was handed, which is a second,
+independent opinion about the same run.
+
+Two further faults sat in the same design and would each have produced their own
+disagreement:
+
+- The permission stage **re-created** `$script:PermissionFindings` on entry,
+  discarding anything recorded by the stages ahead of it.
+- The stages table was four hand-written rows, two of them the constant `PASS`.
+  Three stages that can produce a finding had no row at all — the inline-policy
+  stage among them — so their result was invisible in the review whatever it was.
+
+### The fix
+
+One collection, one way in, one computation.
+
+- **`$script:AuditFindings` is the only finding collection.** It is created once,
+  never reassigned, and never reset mid-run.
+- **`Add-Finding` is the only way in**, and it records and prints in the same
+  call, so the two cannot come apart.
+- **The old `Write-Finding` is split into four writers**, and only one of them can
+  classify something as a problem:
+
+| Writer | Emits | Records |
+| --- | --- | --- |
+| `Write-Step` | `PASS` only — it cannot express anything else | nothing |
+| `Write-Detail` | an unclassified line, for counts | nothing |
+| `Add-Finding` | `REVIEW` or `FAIL` | **yes** |
+| `Write-Verdict` | the single overall line | nothing |
+
+  `Write-Step` taking no severity parameter is the constraint doing the work: a
+  stage reporting progress has no way to reach the terminal with a REVIEW without
+  going through `Add-Finding`.
+
+- **`Add-Finding` no longer accepts a `Pass`.** A findings table is for entries an
+  administrator has to decide about; recording passes there buries them. The
+  per-category permission counts became plain numbers for the same reason — they
+  were being scored `PASS`/`FAIL` a second time, over permissions the individual
+  findings had already judged.
+- **The renderer takes no findings, no per-stage severity, and no verdict as an
+  argument.** The `$Trust` and `$Verdict` parameters are gone rather than
+  corrected. It reads the one collection and calls `Get-OverallSeverity` — the
+  same function the Verdict stage calls.
+- **The stages table is generated** from the findings, by the stage each was
+  recorded under, against the seven stages the script actually announces. A test
+  asserts those seven match the `Write-Section` titles, because a title that
+  drifts would silently score its stage `PASS` forever.
+
+### Verdicts and exit codes, single-sourced
+
+Unchanged in intent; the point is that there is now one route to them.
+
+| Findings | Overall | Exit |
+| --- | --- | --- |
+| no `FAIL`, no `REVIEW` | `PASS` | `0` |
+| no `FAIL`, one or more `REVIEW` | `REVIEW` | `0` |
+| one or more `FAIL` | `FAIL` | `2` |
+| run did not complete | *(no verdict, no review)* | `1` |
+
+A `REVIEW` exits `0` deliberately: it is a request for an administrator's
+judgement, not a failed run, and a non-zero exit would train every future caller
+to treat it as breakage. Resolving a canonically named policy whose document
+parses is a **step**, not a finding — it prints `PASS` and creates no `REVIEW`.
+
+## Defect 2 — the expected inline-policy name was never the deployed one
+
+The audit expected `GracefulGutAI-ReadApiKeySecret`. The deployed role carries
+its secret grant under **`GracefulGutAI-SecretAccess`**. So the `REVIEW` above was
+raised against a role that is, in substance, correct.
+
+### What the evidence supports
+
+The live audit resolved the deployed policy and assessed it: it grants **exactly
+one** Secrets Manager action, scoped to the expected secret, and nothing else. No
+wildcard, no write, no second grant. The policy is right. Only its **name** was
+undocumented here.
+
+`GracefulGutAI-ReadApiKeySecret` appears in this repository in exactly three
+places, and all three are the *same* administrator instruction — `CLAUDE.md`,
+`infrastructure/README.md`, and the Phase 1D report. It appears in **no** commit
+as a record that the command was run. The repository had been treating an
+instruction as though it were a record.
+
+### The correction is repository-only
+
+**No IAM was modified. No AWS call was made during this task. No live policy was
+renamed, and none should be.** Renaming a policy that grants the right thing,
+purely to match a document that was never a record of anything, would be a live
+IAM change made to protect a stale expectation. The document is what moved.
+
+| File | Treatment |
+| --- | --- |
+| `scripts/audit-lambda-execution-role.ps1` | expects `GracefulGutAI-SecretAccess`; the reasoning is recorded next to the constant |
+| `CLAUDE.md` | command names the deployed policy; a note records the old name as **superseded, not an alias** |
+| `infrastructure/README.md` | same treatment |
+| Phase 1D report | **wording left exactly as written**, with a superseded marker |
+| "Judgement call 3" earlier in this report | **wording left as written**, with a superseded marker |
+
+The two runnable commands were corrected because running the old one now would
+add a **second** inline policy beside the working one, not replace it. The two
+historical records keep their original wording, because rewriting them would
+erase where the wrong expectation came from — which is the only part of this
+worth remembering.
+
+## The harness gained scenario G
+
+Scenario G is an inline policy under an unrecognised name, with an otherwise
+**clean** policy document — so the name is the only thing wrong, and a run that
+loses the finding looks entirely clean. It asserts the same finding in every
+place it has to appear, from a single run:
+
+| Where | Assertion |
+| --- | --- |
+| terminal output | the `REVIEW` line naming the policy |
+| REVIEW count | `FAIL: 0. REVIEW: 1.` in the review |
+| stages table | `| Inline policies | REVIEW |` |
+| findings table | the row |
+| corrections | the `## Least-privilege corrections` section |
+| overall verdict | `**Overall: REVIEW**`, and not `PASS` |
+| exit code | `0` — a `REVIEW` is not a failure |
+
+Asserting on the terminal **and** the file from one run is the only arrangement
+that can see the two disagree. Six scenarios that each checked one artefact could
+not have caught this, however many of them there were.
+
+Scenario A now also asserts the negative: a canonically named policy produces no
+`REVIEW` **anywhere** in the terminal output.
+
+## What was deliberately left alone
+
+| Preserved | Status |
+| --- | --- |
+| Scenarios A–F | **Unchanged**, apart from A's added negative assertion |
+| Read-only AWS allow-list | **Unchanged** |
+| Forbidden secret-value operations (`get-secret-value`, `batch-get-secret-value`) | **Unchanged** |
+| Query gate on what a call may ask for | **Unchanged** |
+| No AWS mutation of any kind | **Unchanged** |
+| Pre-write redaction scan — a match writes **no file** | **Unchanged, not weakened** |
+| `Set-StrictMode -Version Latest` | **Unchanged** |
+| Fixed-record parsing and field-by-field validation | **Unchanged** |
+| Review gated on every stage completing | **Unchanged** |
+| The renderer's host-independent shape from Update 3 | **Unchanged** — it worked |
+
+## Verification results — this update
+
+| Check | Result |
+| --- | --- |
+| `.venv/bin/python -m pytest -q` | **653 passed**, 2 warnings |
+| Phase 1G module | **252 passed** (was 238) |
+| `ruff check backend/` | **All checks passed** |
+| `ruff format --check backend/` | **18 files already formatted** |
+| `git diff --check` | **Clean** — no whitespace errors |
+| Runtime harness executed here | **No.** No PowerShell interpreter on this host |
+| Live audit executed here | **No.** Prohibited by the task, and impossible from the dev role |
+
+One test-quality fix went in alongside: the scenario rules were driven off counts
+of identical literal lines, so a scenario that worded its assertions differently
+silently stopped being covered. They are now driven off parsed scenario blocks,
+with a guard test that fails if the parser finds nothing.
+
+## Files — this update
+
+### Modified
+
+| File | Change |
+| --- | --- |
+| `scripts/audit-lambda-execution-role.ps1` | One finding collection; `Write-Finding` split into four writers; `Get-OverallSeverity` and `Get-StageSeverity` added; renderer reads the collection; stages table generated; expected inline-policy name corrected |
+| `scripts/test-audit-lambda-execution-role-runtime.ps1` | Scenario G added; base fixture uses the deployed policy name; scenario A asserts no spurious REVIEW |
+| `backend/tests/test_phase1g_execution_role_audit.py` | 14 net tests added; scenario rules re-driven off parsed blocks |
+| `CLAUDE.md` | Inline-policy name corrected; old name marked superseded |
+| `infrastructure/README.md` | Same |
+| `docs/audits/phase1d-secrets-manager-2026-07-27.md` | Superseded marker only; original wording preserved |
+| `docs/audits/phase1g-lambda-execution-role-audit-2026-07-29.md` | This update, plus a superseded marker on judgement call 3 |
+
+No file was added or deleted.
+
+## AWS resources created, read, modified, or deleted — this update
+
+**None.** No AWS call of any kind was made during this Claude task — not a read,
+not a write, not an identity check. No IAM role or policy was created, modified,
+renamed, or deleted. No Lambda function or Function URL was touched. No Secrets
+Manager operation was attempted and **no secret value was read**. Nothing was
+deployed and nothing was merged to `main`.
+
+AJ's two runs are the AWS activity being reported on. The harness run made **no**
+real AWS call — every call was intercepted by the fake CLI. The live audit made
+**read-only** calls (`sts:GetCallerIdentity`, `lambda:GetFunctionConfiguration`,
+`secretsmanager:DescribeSecret`, and the IAM policy-listing and policy-reading
+operations) and **changed nothing**. No secret value was retrieved by either.
+
+## Security and privacy checks — this update
+
+| Check | Result |
+| --- | --- |
+| Secret **value** read, printed, or stored anywhere | **No** — still forbidden by name, absent from the allow-list, and blocked by the query gate |
+| Secret **identifier** in this report or any tracked file | **No** |
+| Account ID, ARN, instance ID, or URL in this report | **No** |
+| Live inline-policy name in this report | **Yes, deliberately.** A policy name is not a credential, an identifier of a secret, or an ARN. Recording it is the entire point of this update, and the next session needs it to avoid repeating the defect |
+| Redaction weakened to make anything pass | **No** — the pre-write scan is unchanged and still produces no file on a match |
+| IAM modified to match a document | **No** — explicitly refused; the document moved instead |
+| Read-only allow-list, forbidden operations, query gate, StrictMode | **Unchanged** |
+
+## Blockers and unresolved findings — this update
+
+| Item | Status |
+| --- | --- |
+| **G1 — `GracefulGutAI-LambdaExecutionRole` unaudited** | **Substantially answered, formally open.** The live audit completed and assessed the role, but it ran against the *uncorrected* script, so its written review carries the wrong overall verdict. A rerun is what closes this |
+| Corrected harness rerun by AJ | **Not done.** No PowerShell on this host |
+| Corrected live audit rerun by AJ | **Not done.** Prohibited by this task |
+| Whether the deployed role has findings beyond the policy name | **Unknown from the corrected script.** The completed run reported none, but through the logic being replaced here |
+| `GracefulGutAI-LambdaExecutionRole` attached policies | **Readable with administrator credentials** — demonstrated by the completed run. Still unreadable from this host, by design |
+
+### Honest assessment of the remaining risk
+
+The substance of the live audit is reassuring: the role resolved cleanly, the
+secret grant is correctly scoped to one secret, and the only thing the audit
+objected to was a name this repository had recorded wrongly. There is no evidence
+of an over-privileged execution role.
+
+What cannot be claimed is that the **corrected** script produces that same
+result, because it has not been run. The completed audit exercised the logic this
+update replaces. The correction is well covered by tests — 252 of them, including
+a runtime scenario reproducing the exact disagreement — but a test asserting on
+script text is not a run, and this phase has now been wrong about that three
+times. Phase 1G stays open until a corrected run exists.
+
+Nothing here is urgent. The deployed function is unaffected: this task changed no
+code the Lambda executes, no configuration, and no IAM.
+
+## Decisions required from AJ or Jenna — this update
+
+One, and it is a confirmation rather than a choice.
+
+**`GracefulGutAI-SecretAccess` is now recorded as the canonical inline-policy
+name**, on the evidence that it is what the role carries and that the previous
+name appears nowhere as a record of a run. If AJ knows of a deliberate reason the
+role should instead carry `GracefulGutAI-ReadApiKeySecret` — an administrator
+action taken outside this repository, or a second role in play — say so and this
+reverses. Absent that, no action is needed and no IAM should be changed.
+
+No product, security, or architectural decision is required.
+
+## Recommended next step
+
+Rerun the harness. No credentials, no AWS, seconds:
+
+```powershell
+git fetch origin
+git checkout phase1g-lambda-execution-role-audit
+git pull --ff-only
+
+.\scripts\test-audit-lambda-execution-role-runtime.ps1
+```
+
+Exit `0` and "All scenarios passed" is the expected result; scenario G is the new
+one to watch, and it must report `REVIEW` in both the terminal and the review
+file.
+
+Then rerun the live audit with administrator credentials:
+
+```powershell
+.\scripts\audit-lambda-execution-role.ps1 -ExpectedSecretName <secret-name> -NoOpen
+```
+
+**Exit `0` with `Execution role audit: PASS` is now the expected result** — the
+inline policy the previous run flagged is the name the script expects. Compare
+the terminal verdict against `**Overall:**` in the written review: they must
+agree, and that agreement is what this update exists to produce.
+
+Exit `2` means a genuine least-privilege finding; send the review's findings
+table. Exit `1` means it stopped again; send the `DIAGNOSTIC:` line.
 
 Do not paste the secret identifier into this report or any other tracked file.
 
